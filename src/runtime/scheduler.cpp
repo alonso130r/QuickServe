@@ -1,12 +1,19 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
 
-#include "plan.hpp"
-#include "request.cpp"
+#include "handoff.hpp"
+
+struct Request {
+  std::size_t num_tokens;
+  std::vector<Token> tokenized_prompt;
+  std::chrono::time_point<std::chrono::high_resolution_clock> time_of_arrival;
+};
 
 // The scheduler's authoritative view of one request. Lives on the scheduler
 // thread only; the runtime keeps its own separate view (llama sequence ids, KV
@@ -15,7 +22,7 @@ struct RequestState {
   enum class Stage : std::uint8_t { Waiting, Prefill, Decoding, Complete, Paused };
 
   Request req;
-  std::vector<llama_token> output;
+  std::vector<Token> output;
   std::uint32_t prefill_pos = 0; // prompt tokens prefilled so far
   std::uint32_t decoded = 0;     // tokens generated so far
   std::uint32_t target_out = 0;
@@ -51,7 +58,7 @@ public:
   Scheduler &operator=(Scheduler &&) = delete;
 
   // Admit a request. Scheduler thread only. Returns the id that indexes table_
-  // and that SplitRequest/Completion carry.
+  // and that WorkItem/Completion carry.
   std::uint32_t submit(Request req, std::uint32_t max_output_tokens) {
     const auto id = static_cast<std::uint32_t>(table_.size());
     RequestState state;
@@ -110,7 +117,7 @@ private:
   // superseded plan be dropped harmlessly.
   void drain_completions() {
     Completion completion;
-    while (handoff_.next_completion(completion)) {
+    while (handoff_.try_take_completion(completion)) {
       if (completion.id >= table_.size()) {
         continue; // stale id from a previous table generation
       }
@@ -120,12 +127,13 @@ private:
         continue;
       }
 
-      state.prefill_pos = std::max(state.prefill_pos, completion.prefill_pos);
+      state.prefill_pos =
+          std::max(state.prefill_pos, completion.prefill_position);
 
-      if (completion.kind == SplitKind::Decode &&
-          completion.decoded > state.decoded) {
-        state.output.push_back(completion.last_token);
-        state.decoded = completion.decoded;
+      if (completion.kind == WorkKind::Decode &&
+          completion.decoded_tokens > state.decoded) {
+        state.output.push_back(completion.token);
+        state.decoded = completion.decoded_tokens;
       }
 
       if (completion.eos || state.decoded >= state.target_out) {

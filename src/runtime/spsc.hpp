@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <iterator>
 #include <new>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -15,13 +16,10 @@ template <typename T> class SPSCQueue {
 public:
   // constructor; capacity must be a power of two so the index wrap is a mask
   explicit SPSCQueue(std::size_t capacity)
-      : capacity_(capacity), mask_(capacity - 1),
+      : capacity_(validate_capacity(capacity)), mask_(capacity_ - 1),
         storage_(static_cast<Storage *>(::operator new[](
-            sizeof(Storage) * capacity, std::align_val_t{alignof(Storage)}))) {
-    assert(capacity >= 2 && "Capacity must be at least 2");
-    assert((capacity & (capacity - 1)) == 0 &&
-           "Capacity must be a power of two");
-  }
+            sizeof(Storage) * capacity_,
+            std::align_val_t{alignof(Storage)}))) {}
 
   // remove copy/move
   SPSCQueue(const SPSCQueue &) = delete;
@@ -107,6 +105,14 @@ public:
   [[nodiscard]] std::size_t capacity() const { return capacity_; }
 
 private:
+  static std::size_t validate_capacity(std::size_t capacity) {
+    if (capacity < 2 || (capacity & (capacity - 1)) != 0) {
+      throw std::invalid_argument(
+          "SPSCQueue capacity must be a power of two and at least two");
+    }
+    return capacity;
+  }
+
   using Storage = std::aligned_storage_t<sizeof(T), alignof(T)>;
 
   struct alignas(64) PaddedIndex {
