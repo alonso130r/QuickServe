@@ -1,10 +1,42 @@
 #pragma once
 
-#include <atomic>
-#include <chrono>
-#include <cstddef>
 #include <cstdint>
-#include <llama.h>
-#include <vector>
+#include <condition_variable>
+#include <mutex>
+#include <string>
 
-class Template {};
+#include "handoff.hpp"
+
+struct EnvironmentConfig {
+  std::string model_path;
+  std::uint32_t context_size = 0;
+  std::uint32_t batch_capacity = 0;
+  std::uint32_t max_sequences = 0;
+};
+
+struct EnvironmentStartupResult {
+  bool success = false;
+  std::string error;
+};
+
+class Environment {
+public:
+  Environment(Handoff &handoff, EnvironmentConfig config);
+  Environment(const Environment &) = delete;
+  Environment &operator=(const Environment &) = delete;
+  Environment(Environment &&) = delete;
+  Environment &operator=(Environment &&) = delete;
+
+  void run();
+  [[nodiscard]] EnvironmentStartupResult wait_for_startup();
+
+private:
+  void publish_startup(EnvironmentStartupResult result);
+
+  Handoff &handoff_;
+  EnvironmentConfig config_;
+  std::mutex startup_mutex_;
+  std::condition_variable startup_cv_;
+  EnvironmentStartupResult startup_result_;
+  bool startup_ready_ = false;
+};

@@ -30,10 +30,13 @@ struct Plan {
 // completions before retiring that plan. retire_plan() is the epoch commit
 // point, and its release store makes earlier reports visible to the scheduler.
 //
-// After reporting RunFatal, the environment stops consuming plans but remains
-// the consumer of releases and producer of release acknowledgements until the
-// scheduler calls request_stop(). Handoff only transports that state; it does
-// not implement the lifecycle or introduce another producer.
+// After reporting RunFatal, the environment stops consuming plans but keeps
+// draining admissions that the scheduler already queued. It reports
+// EnvironmentStopped for an admission not completed before the fatal, and it
+// remains the consumer of releases and producer of admission results and
+// release acknowledgements until the scheduler calls request_stop(). Handoff
+// only transports that state; it does not implement the lifecycle or
+// introduce another producer.
 class Handoff {
 public:
   explicit Handoff(std::size_t plan_capacity, std::size_t pool_size = 3,

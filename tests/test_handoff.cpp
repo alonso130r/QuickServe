@@ -3,11 +3,11 @@
 // The property under test is that a work unit is executed at most once. A plan
 // may be dropped (the scheduler recomputes it from unadvanced state), but it
 // must never be executed twice: decoding the same position twice corrupts a
-// request's KV cache. Scheduler::step() enforces this by refusing to publish
+// request's KV cache. Scheduler::run_once() enforces this by refusing to publish
 // while a plan is outstanding.
 
 #include "runtime/handoff.hpp"
-#include "runtime/scheduler.cpp"
+#include "runtime/scheduler.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -33,7 +33,7 @@ int g_failures = 0;
   } while (0)
 
 // A policy that prefills in fixed chunks, then decodes one token per iteration.
-// Deliberately memoryless: every plan is derived from table_ alone.
+// Deliberately memoryless: every plan is derived from requests_ alone.
 class ChunkedProbePolicy : public Scheduler {
 public:
   ChunkedProbePolicy(Handoff &handoff, std::uint32_t token_budget,
@@ -41,18 +41,24 @@ public:
       : Scheduler(handoff, token_budget), chunk_(chunk) {}
 
 protected:
-  void create_reordering(Plan &out) override {
-    for (std::uint32_t id = 0; id < table_.size(); ++id) {
-      const RequestState &state = table_[id];
-      if (state.stage == RequestState::Stage::Complete) {
+  void build_plan(Plan &out) override {
+    const auto &states = policy_requests();
+    for (std::uint32_t id = 0; id < states.size(); ++id) {
+      const RequestState &state = states[id];
+      if (state.stage == RequestState::Stage::Terminal ||
+          state.stage == RequestState::Stage::PendingAdmission ||
+          state.stage == RequestState::Stage::PendingRelease) {
         continue;
       }
       if (!state.prefill_done()) {
         const std::uint32_t end =
-            std::min(state.prompt_len(), state.prefill_pos + chunk_);
-        out.work.push_back({id, state.prefill_pos, end, WorkKind::Prefill});
+            std::min(state.prompt_length,
+                     state.prefill_position + chunk_);
+        out.work.push_back(
+            {id, state.prefill_position, end, WorkKind::Prefill});
       } else {
-        const std::uint32_t pos = state.prefill_pos + state.decoded;
+        const std::uint32_t pos =
+            state.prompt_length + state.decoded_count - 1;
         out.work.push_back({id, pos, pos + 1, WorkKind::Decode});
       }
     }
@@ -68,6 +74,17 @@ private:
 class FakeRuntime {
 public:
   void start(Handoff &handoff) {
+    Admission admission{};
+    while (handoff.try_take_admission(admission)) {
+      CHECK(handoff.try_report_admission(AdmissionResult{
+          admission.id, static_cast<std::uint32_t>(admission.prompt.size()),
+          ErrorCode::None}));
+    }
+    Release release{};
+    while (handoff.try_take_release(release)) {
+      CHECK(handoff.try_acknowledge_release(ReleaseAck{release.id}));
+    }
+
     CHECK(in_flight_ == nullptr);
     in_flight_ = handoff.consume_plan();
     if (in_flight_ == nullptr) {
@@ -92,10 +109,15 @@ public:
       completion.kind = work.kind;
       if (work.kind == WorkKind::Prefill) {
         completion.prefill_position = work.token_end;
-        completion.decoded_tokens = table[work.id].decoded;
+        completion.decoded_tokens = table[work.id].decoded_count;
+        if (work.token_end == table[work.id].prompt_length) {
+          completion.decoded_tokens += 1;
+          completion.token = 42;
+          completion.generated_token = true;
+        }
       } else {
-        completion.prefill_position = table[work.id].prefill_pos;
-        completion.decoded_tokens = table[work.id].decoded + 1;
+        completion.prefill_position = table[work.id].prefill_position;
+        completion.decoded_tokens = table[work.id].decoded_count + 1;
         completion.token = 42;
         completion.generated_token = true;
       }
@@ -120,12 +142,8 @@ private:
   int plans_run_ = 0;
 };
 
-Request make_request(std::size_t prompt_tokens) {
-  Request request;
-  request.num_tokens = prompt_tokens;
-  request.tokenized_prompt.assign(prompt_tokens, 7);
-  request.time_of_arrival = std::chrono::high_resolution_clock::now();
-  return request;
+std::string make_prompt(std::size_t prompt_tokens) {
+  return std::string(prompt_tokens, 'x');
 }
 
 // A request driven to completion when scheduler and runtime strictly alternate.
@@ -134,46 +152,47 @@ void test_interleaved_run_completes() {
   Handoff handoff(/*plan_capacity=*/16);
   ChunkedProbePolicy scheduler(handoff, /*token_budget=*/512, /*chunk=*/4);
   const std::uint32_t id =
-      scheduler.submit(make_request(10), /*max_output_tokens=*/3);
+      scheduler.submit(make_prompt(10), /*max_output_tokens=*/3);
 
   FakeRuntime runtime;
   for (int i = 0; i < 20; ++i) {
-    scheduler.step();
-    runtime.run_once(handoff, scheduler.table());
+    scheduler.run_once();
+    runtime.run_once(handoff, scheduler.requests());
   }
 
-  const RequestState &state = scheduler.table()[id];
-  CHECK(state.stage == RequestState::Stage::Complete);
-  CHECK(state.prefill_pos == 10);
-  CHECK(state.decoded == 3);
-  CHECK(state.output.size() == 3);
+  const RequestState &state = scheduler.requests()[id];
+  CHECK(state.stage == RequestState::Stage::Terminal);
+  CHECK(state.prefill_position == 10);
+  CHECK(state.decoded_count == 3);
+  CHECK(state.output_token_ids.size() == 3);
   CHECK(runtime.duplicates() == 0);
 }
 
 // The regression this exists for. Stepping the scheduler while the runtime is
-// mid-execution must not republish work already in flight: table_ has not
+// mid-execution must not republish work already in flight: requests_ has not
 // advanced yet, so a memoryless policy would re-emit the identical decode.
 void test_step_during_execution_does_not_duplicate() {
   std::printf("test_step_during_execution_does_not_duplicate\n");
   Handoff handoff(/*plan_capacity=*/16);
   ChunkedProbePolicy scheduler(handoff, /*token_budget=*/512, /*chunk=*/4);
   const std::uint32_t id =
-      scheduler.submit(make_request(10), /*max_output_tokens=*/3);
+      scheduler.submit(make_prompt(10), /*max_output_tokens=*/3);
 
   FakeRuntime runtime;
   for (int i = 0; i < 20; ++i) {
-    scheduler.step();                        // publish
+    scheduler.run_once();                    // publish
     runtime.start(handoff);                  // consume; now mid-execution
-    scheduler.step();                        // must decline to publish
-    runtime.finish(handoff, scheduler.table());
+    scheduler.run_once();                    // must decline to publish
+    runtime.finish(handoff, scheduler.requests());
   }
 
-  const RequestState &state = scheduler.table()[id];
+  const RequestState &state = scheduler.requests()[id];
   CHECK(runtime.duplicates() == 0);
-  CHECK(state.stage == RequestState::Stage::Complete);
-  CHECK(state.decoded == 3);
-  // 3 prefill chunks (4/4/2) + 3 decodes, and nothing wasted.
-  CHECK(runtime.plans_run() == 6);
+  CHECK(state.stage == RequestState::Stage::Terminal);
+  CHECK(state.decoded_count == 3);
+  // 3 prefill chunks (4/4/2, with the final chunk sampling the first token)
+  // + 2 later decodes, and nothing wasted.
+  CHECK(runtime.plans_run() == 5);
 }
 
 // Several requests share iterations without their work bleeding into one
@@ -182,22 +201,22 @@ void test_multiple_requests_do_not_duplicate() {
   std::printf("test_multiple_requests_do_not_duplicate\n");
   Handoff handoff(/*plan_capacity=*/16);
   ChunkedProbePolicy scheduler(handoff, /*token_budget=*/512, /*chunk=*/3);
-  const std::uint32_t a = scheduler.submit(make_request(7), 2);
-  const std::uint32_t b = scheduler.submit(make_request(2), 4);
+  const std::uint32_t a = scheduler.submit(make_prompt(7), 2);
+  const std::uint32_t b = scheduler.submit(make_prompt(2), 4);
 
   FakeRuntime runtime;
   for (int i = 0; i < 40; ++i) {
-    scheduler.step();
+    scheduler.run_once();
     runtime.start(handoff);
-    scheduler.step();
-    runtime.finish(handoff, scheduler.table());
+    scheduler.run_once();
+    runtime.finish(handoff, scheduler.requests());
   }
 
   CHECK(runtime.duplicates() == 0);
-  CHECK(scheduler.table()[a].stage == RequestState::Stage::Complete);
-  CHECK(scheduler.table()[b].stage == RequestState::Stage::Complete);
-  CHECK(scheduler.table()[a].decoded == 2);
-  CHECK(scheduler.table()[b].decoded == 4);
+  CHECK(scheduler.requests()[a].stage == RequestState::Stage::Terminal);
+  CHECK(scheduler.requests()[b].stage == RequestState::Stage::Terminal);
+  CHECK(scheduler.requests()[a].decoded_count == 2);
+  CHECK(scheduler.requests()[b].decoded_count == 4);
 }
 
 // An idle scheduler must not hand the runtime empty plans to churn on.
@@ -208,8 +227,8 @@ void test_idle_scheduler_publishes_nothing() {
 
   FakeRuntime runtime;
   for (int i = 0; i < 5; ++i) {
-    scheduler.step();
-    runtime.run_once(handoff, scheduler.table());
+    scheduler.run_once();
+    runtime.run_once(handoff, scheduler.requests());
   }
   CHECK(runtime.plans_run() == 0);
 }
@@ -219,18 +238,18 @@ void test_completed_request_is_not_rescheduled() {
   std::printf("test_completed_request_is_not_rescheduled\n");
   Handoff handoff(/*plan_capacity=*/16);
   ChunkedProbePolicy scheduler(handoff, /*token_budget=*/512, /*chunk=*/8);
-  scheduler.submit(make_request(4), /*max_output_tokens=*/1);
+  scheduler.submit(make_prompt(4), /*max_output_tokens=*/1);
 
   FakeRuntime runtime;
   for (int i = 0; i < 10; ++i) {
-    scheduler.step();
-    runtime.run_once(handoff, scheduler.table());
+    scheduler.run_once();
+    runtime.run_once(handoff, scheduler.requests());
   }
   const int settled = runtime.plans_run();
 
   for (int i = 0; i < 10; ++i) {
-    scheduler.step();
-    runtime.run_once(handoff, scheduler.table());
+    scheduler.run_once();
+    runtime.run_once(handoff, scheduler.requests());
   }
   CHECK(runtime.plans_run() == settled);
   CHECK(runtime.duplicates() == 0);

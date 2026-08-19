@@ -11,23 +11,29 @@ set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(external/llama.cpp)
+find_package(Threads REQUIRED)
 
-find_package(pybind11 CONFIG REQUIRED)
-
-pybind11_add_module(_runtime
+add_library(quickserve_runtime
     src/runtime/scheduler.cpp
+    src/runtime/environment.cpp
 )
 
-target_link_libraries(_runtime PRIVATE
+target_link_libraries(quickserve_runtime PUBLIC
     llama
-    ggml
-    ggml-base
-    ggml-metal
+    Threads::Threads
 )
 
-target_include_directories(_runtime PRIVATE
+target_include_directories(quickserve_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+target_compile_features(quickserve_runtime PUBLIC cxx_std_17)
+
+add_library(quickserve_policies src/policies/fifo.cpp)
+target_link_libraries(quickserve_policies PUBLIC quickserve_runtime)
+target_include_directories(quickserve_policies PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_features(quickserve_policies PUBLIC cxx_std_17)
 
 enable_testing()
 add_subdirectory(tests)
