@@ -28,3 +28,6 @@ target_link_libraries(_runtime PRIVATE
 target_include_directories(_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+enable_testing()
+add_subdirectory(tests)

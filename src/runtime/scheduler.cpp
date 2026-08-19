@@ -64,11 +64,30 @@ public:
 
   // One scheduling iteration: fold in what the runtime finished, decide, and
   // publish. Deliberately non-virtual so a policy cannot reorder these steps.
+  //
+  // Lock-step: at most one plan is outstanding. Without this, step() could run
+  // again before any completion arrived, find table_ unadvanced, and re-emit
+  // work the runtime is already executing -- decoding the same position twice
+  // and corrupting that request's KV.
   void step() {
+    // Load the completion signal BEFORE draining. Its acquire pairs with
+    // retire()'s release, so if the plan is done, every completion for it is
+    // already visible to the drain below. Draining first could miss the last
+    // one and rebuild the next plan from stale state.
+    const bool plan_done = handoff_.completed_epoch() >= published_epoch_;
+
     drain_completions();
+
+    if (!plan_done) {
+      return; // previous plan still executing; state is not yet settled
+    }
+
     Plan &plan = handoff_.begin();
     create_reordering(plan);
-    handoff_.commit();
+    if (plan.work.empty()) {
+      return; // nothing schedulable; keep the buffer and retry next tick
+    }
+    published_epoch_ = handoff_.commit();
   }
 
   [[nodiscard]] const std::vector<RequestState> &table() const {
@@ -119,4 +138,8 @@ private:
   }
 
   Handoff &handoff_;
+
+  // Epoch of the outstanding plan. Starts at 0 to match Handoff's initial
+  // completed_epoch_, so the first step() publishes immediately.
+  std::uint64_t published_epoch_ = 0;
 };

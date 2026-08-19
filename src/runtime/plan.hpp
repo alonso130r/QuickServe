@@ -14,6 +14,7 @@
 // advance, sized by the caller against the executor's token budget (n_batch).
 struct Plan {
   std::vector<SplitRequest> work;
+  std::vector<Completion> completions;
   std::uint64_t epoch = 0;
 };
 
@@ -30,6 +31,12 @@ struct Plan {
 // ("advance request 7 by 256 tokens"): dropping it changes nothing, because the
 // next plan is recomputed from the same unadvanced scheduler state. Never let a
 // plan encode a delta.
+//
+// Scheduler::step() currently runs lock-step: it will not publish until the
+// runtime has reported completed_epoch() for the outstanding plan. That makes
+// the overwrite branch in commit() unreachable today. It is kept because it is
+// what a pipelined scheduler would need, and because absolute intent is then
+// load-bearing rather than a safety net.
 class Handoff {
 public:
   // `plan_capacity` is the expected work items per plan; buffers reserve it
@@ -63,9 +70,11 @@ public:
     return *spare_;
   }
 
-  // Publish the buffer from begin() and re-arm a fresh spare.
-  void commit() {
+  // Publish the buffer from begin() and re-arm a fresh spare. Returns the epoch
+  // just published, which the scheduler waits on before publishing again.
+  std::uint64_t commit() {
     spare_->epoch = ++epoch_;
+    const std::uint64_t published = spare_->epoch;
 
     // Release pairs with the runtime's acquire in consume(): it is what carries
     // the vector's contents across, not merely the pointer value. exchange
@@ -74,7 +83,7 @@ public:
 
     if (old != nullptr) {
       spare_ = old; // runtime never took it; reuse immediately
-      return;
+      return published;
     }
 
     // The runtime took the previous buffer and still owns it. Reclaim a retired
@@ -82,6 +91,8 @@ public:
     if (!retired_.try_pop(spare_)) {
       spare_ = allocate_plan();
     }
+
+    return published;
   }
 
   [[nodiscard]] bool next_completion(Completion &out) {
@@ -96,15 +107,27 @@ public:
     return published_.exchange(nullptr, std::memory_order_acquire);
   }
 
+  // Hand a fully-executed plan back and mark its epoch complete.
+  //
+  // CONTRACT: report() every completion for this plan BEFORE calling retire().
+  // retire() is the commit point; anything reported after it belongs to no plan
+  // and the scheduler may not see it until an iteration later.
   void retire(Plan *plan) {
     assert(plan != nullptr);
+    // read epoch before pushing back
+    const std::uint64_t epoch = plan->epoch;
     // A failed push only costs the buffer its place in the pool; the plan stays
     // owned by pool_, and the scheduler allocates a replacement.
     (void)retired_.try_push(plan);
+    completed_epoch_.store(epoch, std::memory_order_release);
   }
 
   [[nodiscard]] bool report(const Completion &completion) {
     return completions_.try_push(completion);
+  }
+
+  [[nodiscard]] std::uint64_t completed_epoch() const {
+    return completed_epoch_.load(std::memory_order_acquire);
   }
 
 private:
@@ -117,8 +140,11 @@ private:
     return plan;
   }
 
+  // runtime -> scheduler, last fully complete epoch
+  std::atomic<std::uint64_t> completed_epoch_{0};
+
   std::atomic<Plan *> published_{nullptr};
-  SPSCQueue<Plan *> retired_;        // runtime -> scheduler, spent buffers
+  SPSCQueue<Plan *> retired_;         // runtime -> scheduler, spent buffers
   SPSCQueue<Completion> completions_; // runtime -> scheduler
 
   // Scheduler-thread only. pool_ is grown solely by the scheduler; the runtime
