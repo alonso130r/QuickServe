@@ -3,3 +3,8 @@ build/
 .clangd
 
 LLM-serving-scheduler-project.md
+
+data/
+
+.DS_store
+
