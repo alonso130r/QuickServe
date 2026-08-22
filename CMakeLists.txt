@@ -3,6 +3,8 @@ project(custom_inference_scheduler LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(QUICKSERVE_TEST_MODEL "" CACHE FILEPATH
+    "Absolute path to a GGUF model used by the real-backend test")
 
 # Apple Silicon backend
 set(GGML_METAL ON CACHE BOOL "" FORCE)

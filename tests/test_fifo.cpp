@@ -83,6 +83,22 @@ void test_oldest_admitted_request_is_selected_first() {
   retire(handoff, plan);
 }
 
+void test_start_time_records_first_published_work() {
+  std::printf("test_start_time_records_first_published_work\n");
+  Handoff handoff(8);
+  FifoScheduler scheduler(handoff, 8);
+  const RequestId first = scheduler.submit("first", 4);
+  const RequestId second = scheduler.submit("second", 4);
+
+  admit_all(scheduler, handoff, {2, 2});
+
+  CHECK(scheduler.requests()[first].start_recorded);
+  CHECK(!scheduler.requests()[second].start_recorded);
+  Plan *plan = take_single_item_plan(handoff, first, 0, 2,
+                                    WorkKind::Prefill);
+  retire(handoff, plan);
+}
+
 void test_prefill_chunks_follow_acknowledged_progress() {
   std::printf("test_prefill_chunks_follow_acknowledged_progress\n");
   Handoff handoff(8);
@@ -458,6 +474,7 @@ void test_decode_position_overflow_fails_explicitly_and_releases() {
 
 int main() {
   test_oldest_admitted_request_is_selected_first();
+  test_start_time_records_first_published_work();
   test_prefill_chunks_follow_acknowledged_progress();
   test_final_prefill_token_leads_to_exact_decode_range();
   test_pending_admission_and_terminal_requests_are_skipped();

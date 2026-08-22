@@ -75,7 +75,18 @@ bool Scheduler::run_once() {
       last_error_ = std::move(validation);
       enter_draining(ErrorCode::ProtocolViolation);
     } else {
-      published_epoch_ = handoff_.commit();
+      const RequestState::TimePoint start_time = RequestState::Clock::now();
+      const std::uint64_t published_epoch = handoff_.commit();
+      if (published_epoch != 0) {
+        published_epoch_ = published_epoch;
+        for (const WorkItem &work : plan.work) {
+          RequestState &state = requests_[work.id];
+          if (!state.start_recorded) {
+            state.start_time = start_time;
+            state.start_recorded = true;
+          }
+        }
+      }
     }
   } else if (!release_pending) {
     // An empty plan is only legitimate while a policy deliberately waits for
@@ -154,8 +165,6 @@ void Scheduler::drain_admission_results() {
 
     state.admission = RequestState::AdmissionOwnership::EnvironmentOwned;
     state.prompt_length = result.prompt_tokens;
-    state.start_time = RequestState::Clock::now();
-    state.start_recorded = true;
     if (draining_ || state.max_output_tokens == 0) {
       move_to_pending_release(state,
                               draining_ ? drain_error_ : ErrorCode::None);
