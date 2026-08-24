@@ -19,6 +19,15 @@ struct EnvironmentStartupResult {
   std::string error;
 };
 
+[[nodiscard]] constexpr ErrorCode validate_synthetic_workload(
+    std::uint32_t prompt_tokens, std::uint32_t max_output_tokens,
+    std::uint32_t context_size) noexcept {
+  return static_cast<std::uint64_t>(prompt_tokens) + max_output_tokens >
+                 context_size
+             ? ErrorCode::ContextCapacityExceeded
+             : ErrorCode::None;
+}
+
 class Environment {
 public:
   Environment(Handoff &handoff, EnvironmentConfig config);

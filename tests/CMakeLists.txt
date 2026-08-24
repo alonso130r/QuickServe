@@ -16,6 +16,22 @@ endfunction()
 add_executable(test_protocol test_protocol.cpp)
 configure_model_free_test(test_protocol protocol)
 
+add_executable(test_trace
+    test_trace.cpp
+    ${CMAKE_SOURCE_DIR}/src/benchmark/trace.cpp
+)
+configure_model_free_test(test_trace trace)
+
+add_executable(test_benchmark
+    test_benchmark.cpp
+    ${CMAKE_SOURCE_DIR}/src/benchmark/trace.cpp
+    ${CMAKE_SOURCE_DIR}/src/benchmark/replay.cpp
+    ${CMAKE_SOURCE_DIR}/src/benchmark/results.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/scheduler.cpp
+    ${CMAKE_SOURCE_DIR}/src/policies/fifo.cpp
+)
+configure_model_free_test(test_benchmark benchmark)
+
 # Model-free handoff tests link nothing from llama.cpp, so building them does
 # not pull in the model backend.
 add_executable(test_handoff
@@ -36,6 +52,13 @@ add_executable(test_fifo
     ${CMAKE_SOURCE_DIR}/src/runtime/scheduler.cpp
 )
 configure_model_free_test(test_fifo fifo)
+
+add_executable(test_continuous_batched_fifo
+    test_continuous_batched_fifo.cpp
+    ${CMAKE_SOURCE_DIR}/src/policies/continuous_batched_fifo.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/scheduler.cpp
+)
+configure_model_free_test(test_continuous_batched_fifo continuous_batched_fifo)
 
 if(QUICKSERVE_TEST_MODEL)
     get_filename_component(QUICKSERVE_TEST_MODEL_ABSOLUTE

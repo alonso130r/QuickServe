@@ -1,13 +1,16 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 using RequestId = std::uint32_t;
 using Token = std::int32_t;
 
 enum class WorkKind : std::uint8_t { Prefill, Decode };
+enum class OutputMode : std::uint8_t { Natural, TraceExact };
 
 enum class ErrorCode : std::uint8_t {
   None,
@@ -23,6 +26,17 @@ struct Admission {
   RequestId id = 0;
   std::string prompt;
   std::uint32_t max_output_tokens = 0;
+  std::optional<std::uint32_t> synthetic_prompt_tokens;
+  OutputMode output_mode = OutputMode::Natural;
+
+  Admission() = default;
+  Admission(RequestId request_id, std::string request_prompt,
+            std::uint32_t output_tokens,
+            std::optional<std::uint32_t> synthetic_tokens = std::nullopt,
+            OutputMode mode = OutputMode::Natural)
+      : id(request_id), prompt(std::move(request_prompt)),
+        max_output_tokens(output_tokens),
+        synthetic_prompt_tokens(synthetic_tokens), output_mode(mode) {}
 };
 
 struct AdmissionResult {

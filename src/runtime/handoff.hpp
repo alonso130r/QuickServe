@@ -4,7 +4,10 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -101,6 +104,7 @@ public:
 
   void request_stop() {
     stop_requested_.store(true, std::memory_order_release);
+    notify_scheduler_progress();
   }
 
   // --- environment thread: sole consumer -------------------------------
@@ -123,23 +127,27 @@ public:
   // retries the corresponding message before producing a later one on that
   // channel.
   [[nodiscard]] bool try_report_admission(const AdmissionResult &result) {
-    return admission_results_.try_push(result);
+    return publish_to_scheduler(admission_results_, result);
   }
 
   [[nodiscard]] bool try_report_completion(const Completion &completion) {
-    return completions_.try_push(completion);
+    return publish_to_scheduler(completions_, completion);
   }
 
   [[nodiscard]] bool try_report_output(OutputPiece &&piece) {
-    return outputs_.try_push(std::move(piece));
+    if (!outputs_.try_push(std::move(piece))) {
+      return false;
+    }
+    notify_scheduler_progress();
+    return true;
   }
 
   [[nodiscard]] bool try_acknowledge_release(const ReleaseAck &ack) {
-    return release_acks_.try_push(ack);
+    return publish_to_scheduler(release_acks_, ack);
   }
 
   [[nodiscard]] bool try_report_fatal(const RunFatal &fatal) {
-    return fatals_.try_push(fatal);
+    return publish_to_scheduler(fatals_, fatal);
   }
 
   // CONTRACT: report every completion for plan before calling retire_plan().
@@ -148,6 +156,7 @@ public:
     const std::uint64_t epoch = plan->epoch;
     (void)retired_.try_push(plan);
     completed_epoch_.store(epoch, std::memory_order_release);
+    notify_scheduler_progress();
   }
 
   // --- scheduler thread: sole consumer ----------------------------------
@@ -181,7 +190,46 @@ public:
     return stop_requested_.load(std::memory_order_acquire);
   }
 
+  [[nodiscard]] std::uint64_t scheduler_progress_generation() const {
+    return scheduler_progress_generation_.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] bool wait_for_scheduler_progress(
+      std::uint64_t snapshot,
+      std::chrono::steady_clock::time_point deadline) const {
+    std::unique_lock<std::mutex> lock(scheduler_progress_mutex_);
+    return scheduler_progress_cv_.wait_until(lock, deadline, [&] {
+      return scheduler_progress_generation() != snapshot || stop_requested();
+    });
+  }
+
+  // Wake a scheduler-side replay wait without requesting environment stop.
+  // Used by Scheduler::request_stop(), whose lifecycle flag is distinct from
+  // Handoff's environment-stop flag.
+  void wake_scheduler() { notify_scheduler_progress(); }
+
 private:
+  template <typename Queue, typename Message>
+  [[nodiscard]] bool publish_to_scheduler(Queue &queue,
+                                          const Message &message) {
+    if (!queue.try_push(message)) {
+      return false;
+    }
+    notify_scheduler_progress();
+    return true;
+  }
+
+  void notify_scheduler_progress() {
+    {
+      // The generation transition and the wait predicate share this mutex.
+      // Without it, publication can land after wait_until's predicate check
+      // but before the waiter actually blocks, losing the only notification.
+      std::lock_guard<std::mutex> lock(scheduler_progress_mutex_);
+      scheduler_progress_generation_.fetch_add(1, std::memory_order_release);
+    }
+    scheduler_progress_cv_.notify_all();
+  }
+
   static std::size_t validate_pool_size(std::size_t pool_size,
                                         std::size_t queue_capacity) {
     if (pool_size < 2) {
@@ -205,6 +253,9 @@ private:
   std::atomic<std::uint64_t> completed_epoch_{0};
   std::atomic<Plan *> published_{nullptr};
   std::atomic<bool> stop_requested_{false};
+  std::atomic<std::uint64_t> scheduler_progress_generation_{0};
+  mutable std::mutex scheduler_progress_mutex_;
+  mutable std::condition_variable scheduler_progress_cv_;
 
   SPSCQueue<Plan *> retired_; // environment -> scheduler
 

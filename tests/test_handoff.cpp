@@ -43,8 +43,7 @@ public:
 protected:
   void build_plan(Plan &out) override {
     const auto &states = policy_requests();
-    for (std::uint32_t id = 0; id < states.size(); ++id) {
-      const RequestState &state = states[id];
+    for (const RequestState &state : states) {
       if (state.stage == RequestState::Stage::Terminal ||
           state.stage == RequestState::Stage::PendingAdmission ||
           state.stage == RequestState::Stage::PendingRelease) {
@@ -55,11 +54,11 @@ protected:
             std::min(state.prompt_length,
                      state.prefill_position + chunk_);
         out.work.push_back(
-            {id, state.prefill_position, end, WorkKind::Prefill});
+            {state.id, state.prefill_position, end, WorkKind::Prefill});
       } else {
         const std::uint32_t pos =
             state.prompt_length + state.decoded_count - 1;
-        out.work.push_back({id, pos, pos + 1, WorkKind::Decode});
+        out.work.push_back({state.id, pos, pos + 1, WorkKind::Decode});
       }
     }
   }
@@ -267,7 +266,28 @@ void test_admission_round_trip() {
   CHECK(received.id == 17);
   CHECK(received.prompt == "owned prompt");
   CHECK(received.max_output_tokens == 23);
+  CHECK(!received.synthetic_prompt_tokens.has_value());
+  CHECK(received.output_mode == OutputMode::Natural);
   CHECK(!handoff.try_take_admission(received));
+}
+
+void test_synthetic_admission_round_trip() {
+  std::printf("test_synthetic_admission_round_trip\n");
+  Handoff handoff(/*plan_capacity=*/4);
+  Admission admission{};
+  admission.id = 18;
+  admission.max_output_tokens = 29;
+  admission.synthetic_prompt_tokens = 113;
+  admission.output_mode = OutputMode::TraceExact;
+
+  CHECK(handoff.try_admit(std::move(admission)));
+  Admission received{};
+  CHECK(handoff.try_take_admission(received));
+  CHECK(received.id == 18);
+  CHECK(received.prompt.empty());
+  CHECK(received.max_output_tokens == 29);
+  CHECK(received.synthetic_prompt_tokens == 113);
+  CHECK(received.output_mode == OutputMode::TraceExact);
 }
 
 void test_admission_result_round_trip() {
@@ -571,6 +591,58 @@ void test_transport_carries_fatal_and_releases_for_all_active_ids() {
   CHECK(!handoff.try_take_release(release));
 }
 
+void test_scheduler_progress_generation_covers_publication_retirement_stop() {
+  std::printf(
+      "test_scheduler_progress_generation_covers_publication_retirement_stop\n");
+  Handoff handoff(4);
+  const std::uint64_t initial = handoff.scheduler_progress_generation();
+  CHECK(handoff.try_report_admission(AdmissionResult{1, 2, ErrorCode::None}));
+  CHECK(handoff.scheduler_progress_generation() == initial + 1);
+
+  Plan &plan = handoff.begin();
+  plan.work.push_back({1, 0, 1, WorkKind::Prefill});
+  CHECK(handoff.commit() != 0);
+  Plan *published = handoff.consume_plan();
+  CHECK(published != nullptr);
+  const std::uint64_t after_report = handoff.scheduler_progress_generation();
+  handoff.retire_plan(published);
+  CHECK(handoff.scheduler_progress_generation() == after_report + 1);
+
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(1);
+  CHECK(handoff.wait_for_scheduler_progress(initial, deadline));
+  const std::uint64_t before_stop = handoff.scheduler_progress_generation();
+  handoff.request_stop();
+  CHECK(handoff.wait_for_scheduler_progress(before_stop, deadline));
+}
+
+void test_scheduler_progress_wait_wakes_promptly_under_publication_races() {
+  std::printf(
+      "test_scheduler_progress_wait_wakes_promptly_under_publication_races\n");
+  Handoff handoff(4, 2, 2);
+  for (RequestId id = 0; id < 2000; ++id) {
+    const std::uint64_t snapshot = handoff.scheduler_progress_generation();
+    std::atomic<bool> waiter_started{false};
+    std::atomic<bool> woke{false};
+    std::thread waiter([&] {
+      waiter_started.store(true, std::memory_order_release);
+      woke.store(handoff.wait_for_scheduler_progress(
+                     snapshot, std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(100)),
+                 std::memory_order_release);
+    });
+    while (!waiter_started.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    CHECK(handoff.try_report_admission(
+        AdmissionResult{id, 1, ErrorCode::None}));
+    waiter.join();
+    CHECK(woke.load(std::memory_order_acquire));
+    AdmissionResult drained{};
+    CHECK(handoff.try_take_admission_result(drained));
+  }
+}
+
 } // namespace
 
 int main() {
@@ -580,6 +652,7 @@ int main() {
   test_idle_scheduler_publishes_nothing();
   test_completed_request_is_not_rescheduled();
   test_admission_round_trip();
+  test_synthetic_admission_round_trip();
   test_admission_result_round_trip();
   test_owned_output_piece_round_trip();
   test_release_and_acknowledgement_round_trip();
@@ -592,6 +665,8 @@ int main() {
   test_invalid_queue_capacity_is_rejected_safely();
   test_invalid_plan_pool_size_is_rejected_safely();
   test_transport_carries_fatal_and_releases_for_all_active_ids();
+  test_scheduler_progress_generation_covers_publication_retirement_stop();
+  test_scheduler_progress_wait_wakes_promptly_under_publication_races();
 
   if (g_failures != 0) {
     std::printf("\n%d check(s) failed\n", g_failures);

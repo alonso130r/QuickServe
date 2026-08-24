@@ -1,10 +1,12 @@
 #include "runtime/scheduler.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <list>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -12,6 +14,35 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+namespace {
+std::atomic<std::size_t> g_fail_allocation_size{0};
+std::atomic<bool> g_fail_next_allocation{false};
+}
+
+void *operator new(std::size_t size) {
+  if (g_fail_next_allocation.exchange(false, std::memory_order_acq_rel)) {
+    throw std::bad_alloc();
+  }
+  std::size_t expected = size;
+  if (g_fail_allocation_size.compare_exchange_strong(
+          expected, 0, std::memory_order_acq_rel)) {
+    throw std::bad_alloc();
+  }
+  if (void *memory = std::malloc(size)) {
+    return memory;
+  }
+  throw std::bad_alloc();
+}
+
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+
+void *operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete[](void *memory) noexcept { ::operator delete(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  ::operator delete(memory);
+}
 
 namespace {
 
@@ -30,8 +61,24 @@ public:
   explicit ProbePolicy(Handoff &handoff, std::uint32_t budget = 32)
       : Scheduler(handoff, budget) {}
 
+  ProbePolicy(Handoff &handoff, std::uint32_t budget, ClockFunction clock)
+      : Scheduler(handoff, budget, std::move(clock)) {}
+
   std::vector<WorkItem> next_work;
   int builds = 0;
+
+  [[nodiscard]] RequestState::Stage live_stage(RequestId id) const {
+    for (const RequestState &state : policy_requests()) {
+      if (state.id == id) {
+        return state.stage;
+      }
+    }
+    throw std::logic_error("request is not live");
+  }
+
+  [[nodiscard]] std::size_t live_count() const {
+    return policy_requests().size();
+  }
 
 protected:
   void build_plan(Plan &out) override {
@@ -65,15 +112,69 @@ protected:
       return;
     }
     for (const WorkItem &work : next_work) {
-      if (work.id < states.size() &&
-          states[work.id].stage != RequestState::Stage::Terminal &&
-          states[work.id].stage != RequestState::Stage::PendingAdmission &&
-          states[work.id].stage != RequestState::Stage::PendingRelease) {
-        out.work.push_back(work);
+      for (const RequestState &state : states) {
+        if (state.id == work.id &&
+            state.stage != RequestState::Stage::Terminal &&
+            state.stage != RequestState::Stage::PendingAdmission &&
+            state.stage != RequestState::Stage::PendingRelease) {
+          out.work.push_back(work);
+          break;
+        }
       }
     }
   }
 };
+
+void test_workload_counts_distinguish_queued_and_active() {
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  const RequestId id = scheduler.submit_synthetic(2, 1);
+  auto counts = scheduler.workload_counts();
+  CHECK(counts.queued == 1);
+  CHECK(counts.active == 0);
+  CHECK(scheduler.run_once());
+  Admission admission;
+  CHECK(handoff.try_take_admission(admission));
+  CHECK(handoff.try_report_admission({id, 2, ErrorCode::None}));
+  CHECK(scheduler.run_once());
+  counts = scheduler.workload_counts();
+  CHECK(counts.queued == 0);
+  CHECK(counts.active == 1);
+}
+
+void test_workload_counts_handle_burst_without_policy_scan() {
+  Handoff handoff(8, 3, 2048);
+  ProbePolicy scheduler(handoff);
+  for (std::uint32_t i = 0; i < 1000; ++i) {
+    const auto id = scheduler.submit_synthetic(1, 1);
+    CHECK(id == i);
+  }
+  const auto counts = scheduler.workload_counts();
+  CHECK(counts.queued == 1000);
+  CHECK(counts.active == 0);
+}
+
+void test_workload_observer_reports_transitions_at_scheduler_clock() {
+  Handoff handoff(8);
+  RequestState::TimePoint now{};
+  ProbePolicy scheduler(handoff, 32, [&] { return now; });
+  std::vector<std::pair<std::int64_t, SchedulerWorkloadCounts>> samples;
+  scheduler.set_workload_observer([&](RequestState::TimePoint at, SchedulerWorkloadCounts counts) {
+    samples.push_back({std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count(), counts});
+  });
+  now += std::chrono::nanoseconds(10);
+  const auto id = scheduler.submit_synthetic(2, 1);
+  CHECK(samples.back().first == 10);
+  CHECK(samples.back().second.queued == 1);
+  scheduler.run_once();
+  Admission admission; CHECK(handoff.try_take_admission(admission));
+  CHECK(handoff.try_report_admission({id, 2, ErrorCode::None}));
+  now += std::chrono::nanoseconds(5);
+  scheduler.run_once();
+  CHECK(samples.back().first == 15);
+  CHECK(samples.back().second.active == 1);
+  CHECK(samples.back().second.queued == 0);
+}
 
 class EmptyPolicy final : public Scheduler {
 public:
@@ -107,9 +208,13 @@ public:
   std::vector<WorkItem> next_work;
 
   void force_decode_without_generated_token(RequestId id) {
-    auto &states = const_cast<std::vector<RequestState> &>(policy_requests());
-    states[id].stage = RequestState::Stage::Decode;
-    states[id].decoded_count = 0;
+    auto &states = const_cast<std::list<RequestState> &>(policy_requests());
+    for (RequestState &state : states) {
+      if (state.id == id) {
+        state.stage = RequestState::Stage::Decode;
+        state.decoded_count = 0;
+      }
+    }
   }
 
 protected:
@@ -779,6 +884,7 @@ void test_eos_and_output_limit_release_then_ack_terminal() {
         Completion{id, 2, 1, 9, WorkKind::Prefill, ErrorCode::None, true,
                    eos}));
     scheduler.run_once();
+    CHECK(scheduler.requests()[id].eog_observed == eos);
     CHECK(scheduler.requests()[id].stage ==
           RequestState::Stage::PendingRelease);
     CHECK(!scheduler.all_terminal());
@@ -791,6 +897,37 @@ void test_eos_and_output_limit_release_then_ack_terminal() {
     CHECK(scheduler.requests()[id].finish_recorded);
     CHECK(scheduler.all_terminal());
   }
+}
+
+void test_trace_exact_latches_eog_and_continues_to_output_limit() {
+  std::printf("test_trace_exact_latches_eog_and_continues_to_output_limit\n");
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  const RequestId id = scheduler.submit_synthetic(
+      /*prompt_tokens=*/7, /*max_output_tokens=*/2, OutputMode::TraceExact);
+  scheduler.run_once();
+  const Admission admission = take_admission(handoff);
+  CHECK(admission.id == id);
+  CHECK(admission.prompt.empty());
+  CHECK(admission.synthetic_prompt_tokens == 7);
+  CHECK(admission.output_mode == OutputMode::TraceExact);
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{id, 7, ErrorCode::None}));
+  scheduler.run_once();
+
+  CHECK(handoff.try_report_completion(
+      Completion{id, 7, 1, 9, WorkKind::Prefill, ErrorCode::None, true,
+                 true}));
+  scheduler.run_once();
+  CHECK(scheduler.requests()[id].eog_observed);
+  CHECK(scheduler.requests()[id].stage == RequestState::Stage::Decode);
+
+  CHECK(handoff.try_report_completion(
+      Completion{id, 7, 2, 10, WorkKind::Decode, ErrorCode::None, true,
+                 false}));
+  scheduler.run_once();
+  CHECK(scheduler.requests()[id].stage ==
+        RequestState::Stage::PendingRelease);
 }
 
 void test_release_retries_when_queue_is_full() {
@@ -1092,9 +1229,386 @@ void test_request_stop_retries_owned_release_before_final_stop() {
   CHECK(handoff.stop_requested());
 }
 
+void test_streaming_observer_waits_for_release_ack_and_retires() {
+  std::printf("test_streaming_observer_waits_for_release_ack_and_retires\n");
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  std::vector<RequestState> observed;
+  scheduler.enable_streaming_retirement(
+      [&](const RequestState &state) noexcept {
+        observed.push_back(state);
+        return true;
+      });
+  const RequestId id = scheduler.submit("prompt", 1);
+  admit_success(scheduler, handoff, id, 2);
+  CHECK(handoff.try_report_completion(Completion{
+      id, 2, 1, 9, WorkKind::Prefill, ErrorCode::None, true, false}));
+  scheduler.run_once();
+  CHECK(observed.empty());
+  Release release{};
+  CHECK(handoff.try_take_release(release));
+  CHECK(handoff.try_acknowledge_release(ReleaseAck{id}));
+  scheduler.run_once();
+  CHECK(observed.size() == 1);
+  CHECK(observed.front().id == id);
+  CHECK(scheduler.all_terminal());
+  bool threw = false;
+  try {
+    (void)scheduler.requests();
+  } catch (const std::logic_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+}
+
+void test_streaming_observer_sees_unowned_rejection_once() {
+  std::printf("test_streaming_observer_sees_unowned_rejection_once\n");
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  int observations = 0;
+  scheduler.enable_streaming_retirement(
+      [&](const RequestState &state) noexcept {
+        ++observations;
+        CHECK(state.terminal_error == ErrorCode::TokenizationFailed);
+        CHECK(!state.admission_succeeded);
+        return true;
+      });
+  const RequestId id = scheduler.submit("bad", 1);
+  scheduler.run_once();
+  take_admission(handoff);
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{id, 0, ErrorCode::TokenizationFailed}));
+  scheduler.run_once();
+  scheduler.run_once();
+  CHECK(observations == 1);
+  CHECK(scheduler.all_terminal());
+}
+
+void test_streaming_observer_preserves_terminal_message_order() {
+  std::printf("test_streaming_observer_preserves_terminal_message_order\n");
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  std::vector<RequestId> observed;
+  scheduler.enable_streaming_retirement(
+      [&](const RequestState &state) {
+        observed.push_back(state.id);
+        return true;
+      });
+  const RequestId first = scheduler.submit("first", 1);
+  const RequestId second = scheduler.submit("second", 1);
+  scheduler.run_once();
+  take_admission(handoff);
+  take_admission(handoff);
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{second, 0, ErrorCode::TokenizationFailed}));
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{first, 0, ErrorCode::TokenizationFailed}));
+  scheduler.run_once();
+  CHECK(observed.size() == 2);
+  CHECK(observed[0] == second);
+  CHECK(observed[1] == first);
+}
+
+void test_observer_failure_disables_observation_and_enters_draining() {
+  std::printf("test_observer_failure_disables_observation_and_enters_draining\n");
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  int calls = 0;
+  scheduler.enable_streaming_retirement(
+      [&](const RequestState &) noexcept {
+        ++calls;
+        return false;
+      });
+  const RequestId first = scheduler.submit("bad", 1);
+  const RequestId second = scheduler.submit("queued", 1);
+  scheduler.run_once();
+  Admission admission = take_admission(handoff);
+  CHECK(admission.id == first);
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{first, 0, ErrorCode::TokenizationFailed}));
+  scheduler.run_once();
+  CHECK(calls == 1);
+  CHECK(!scheduler.last_error().valid);
+  Admission maybe_second{};
+  CHECK(handoff.try_take_admission(maybe_second));
+  CHECK(maybe_second.id == second);
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{second, 0, ErrorCode::EnvironmentStopped}));
+  scheduler.run_once();
+  CHECK(calls == 1);
+  CHECK(scheduler.all_terminal());
+}
+
+void test_injected_clock_drives_scheduler_timestamps() {
+  std::printf("test_injected_clock_drives_scheduler_timestamps\n");
+  Handoff handoff(8);
+  RequestState::TimePoint now(std::chrono::nanoseconds(10));
+  ProbePolicy scheduler(handoff, 32, [&] { return now; });
+  const RequestId id = scheduler.submit("bad", 1);
+  CHECK(scheduler.requests()[id].arrival_time == now);
+  scheduler.run_once();
+  take_admission(handoff);
+  now = RequestState::TimePoint(std::chrono::nanoseconds(25));
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{id, 0, ErrorCode::TokenizationFailed}));
+  scheduler.run_once();
+  CHECK(scheduler.requests()[id].finish_time == now);
+}
+
+void test_injected_clock_records_each_generated_token_time() {
+  std::printf("test_injected_clock_records_each_generated_token_time\n");
+  Handoff handoff(8);
+  RequestState::TimePoint now(std::chrono::nanoseconds(10));
+  ProbePolicy scheduler(handoff, 32, [&] { return now; });
+  const RequestId id = scheduler.submit("prompt", 3);
+  admit_success(scheduler, handoff, id, 2);
+  now = RequestState::TimePoint(std::chrono::nanoseconds(20));
+  CHECK(handoff.try_report_completion(Completion{
+      id, 2, 1, 9, WorkKind::Prefill, ErrorCode::None, true, false}));
+  scheduler.run_once();
+  now = RequestState::TimePoint(std::chrono::nanoseconds(35));
+  CHECK(handoff.try_report_completion(Completion{
+      id, 2, 2, 10, WorkKind::Decode, ErrorCode::None, true, false}));
+  scheduler.run_once();
+  CHECK(scheduler.requests()[id].first_token_time ==
+        RequestState::TimePoint(std::chrono::nanoseconds(20)));
+  CHECK(scheduler.requests()[id].last_token_time ==
+        RequestState::TimePoint(std::chrono::nanoseconds(35)));
+  CHECK(scheduler.requests()[id].last_token_recorded);
+}
+
+void test_cross_thread_request_stop_does_not_mutate_inspection_snapshot() {
+  std::printf(
+      "test_cross_thread_request_stop_does_not_mutate_inspection_snapshot\n");
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  scheduler.submit("one", 1);
+  scheduler.submit("two", 1);
+  const std::vector<RequestState> &snapshot = scheduler.requests();
+  CHECK(snapshot.size() == 2);
+  std::thread stopper([&] { scheduler.request_stop(); });
+  stopper.join();
+  CHECK(snapshot.size() == 2);
+  CHECK(snapshot[0].id == 0);
+  CHECK(snapshot[1].id == 1);
+}
+
+void test_observer_may_submit_enough_requests_to_rehash_lookup() {
+  std::printf("test_observer_may_submit_enough_requests_to_rehash_lookup\n");
+  Handoff handoff(8, 2, 2);
+  ProbePolicy scheduler(handoff);
+  int observations = 0;
+  scheduler.enable_streaming_retirement([&](const RequestState &) {
+    ++observations;
+    for (int i = 0; i < 2048; ++i) {
+      scheduler.submit("rehash", 1);
+    }
+    return true;
+  });
+  const RequestId id = scheduler.submit("bad", 1);
+  scheduler.run_once();
+  take_admission(handoff);
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{id, 0, ErrorCode::TokenizationFailed}));
+  scheduler.run_once();
+  CHECK(observations == 1);
+}
+
+void test_throwing_clock_does_not_half_finish_unowned_rejection() {
+  std::printf(
+      "test_throwing_clock_does_not_half_finish_unowned_rejection\n");
+  Handoff handoff(8);
+  bool throw_clock = false;
+  ProbePolicy scheduler(handoff, 32, [&] {
+    if (throw_clock) {
+      throw std::runtime_error("clock failed");
+    }
+    return RequestState::TimePoint{};
+  });
+  int observations = 0;
+  scheduler.enable_streaming_retirement(
+      [&](const RequestState &) { ++observations; return true; });
+  const RequestId id = scheduler.submit("bad", 1);
+  scheduler.run_once();
+  take_admission(handoff);
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{id, 0, ErrorCode::TokenizationFailed}));
+  throw_clock = true;
+  bool threw = false;
+  try {
+    scheduler.run_once();
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+  CHECK(observations == 0);
+  CHECK(scheduler.live_stage(id) == RequestState::Stage::PendingAdmission);
+  throw_clock = false;
+  scheduler.run_once();
+  CHECK(observations == 1);
+  CHECK(scheduler.all_terminal());
+}
+
+void test_throwing_clock_does_not_half_finish_release_ack() {
+  std::printf("test_throwing_clock_does_not_half_finish_release_ack\n");
+  Handoff handoff(8);
+  bool throw_clock = false;
+  ProbePolicy scheduler(handoff, 32, [&] {
+    if (throw_clock) {
+      throw std::runtime_error("clock failed");
+    }
+    return RequestState::TimePoint{};
+  });
+  int observations = 0;
+  scheduler.enable_streaming_retirement(
+      [&](const RequestState &) { ++observations; return true; });
+  const RequestId id = scheduler.submit("prompt", 1);
+  admit_success(scheduler, handoff, id, 2);
+  CHECK(handoff.try_report_completion(Completion{
+      id, 2, 1, 9, WorkKind::Prefill, ErrorCode::None, true, false}));
+  scheduler.run_once();
+  Release release{};
+  CHECK(handoff.try_take_release(release));
+  CHECK(handoff.try_acknowledge_release(ReleaseAck{id}));
+  throw_clock = true;
+  bool threw = false;
+  try {
+    scheduler.run_once();
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+  CHECK(observations == 0);
+  CHECK(scheduler.live_stage(id) == RequestState::Stage::PendingRelease);
+  throw_clock = false;
+  scheduler.run_once();
+  CHECK(observations == 1);
+  CHECK(scheduler.all_terminal());
+}
+
+void test_throwing_submit_clock_leaves_no_partial_request() {
+  std::printf("test_throwing_submit_clock_leaves_no_partial_request\n");
+  Handoff handoff(8);
+  bool throw_clock = true;
+  ProbePolicy scheduler(handoff, 32, [&] {
+    if (throw_clock) {
+      throw std::runtime_error("clock failed");
+    }
+    return RequestState::TimePoint{};
+  });
+  bool threw = false;
+  try {
+    scheduler.submit("first", 1);
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+  CHECK(scheduler.requests().empty());
+  throw_clock = false;
+  const RequestId next = scheduler.submit("second", 1);
+  CHECK(next == 1);
+  CHECK(scheduler.requests().size() == 1);
+  CHECK(scheduler.requests().front().id == next);
+}
+
+void test_cross_thread_request_stop_wakes_replay_wait_without_handoff_stop() {
+  std::printf(
+      "test_cross_thread_request_stop_wakes_replay_wait_without_handoff_stop\n");
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  const std::uint64_t snapshot = handoff.scheduler_progress_generation();
+  std::atomic<bool> waiting{false};
+  std::atomic<bool> woke{false};
+  std::thread waiter([&] {
+    waiting.store(true, std::memory_order_release);
+    woke.store(handoff.wait_for_scheduler_progress(
+                   snapshot, std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(2)),
+               std::memory_order_release);
+  });
+  while (!waiting.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  scheduler.request_stop();
+  waiter.join();
+  CHECK(woke.load(std::memory_order_acquire));
+  CHECK(!handoff.stop_requested());
+}
+
+void test_history_copy_failure_retains_terminal_retirement_marker() {
+  std::printf(
+      "test_history_copy_failure_retains_terminal_retirement_marker\n");
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  const RequestId id = scheduler.submit("bad", 1);
+  scheduler.run_once();
+  take_admission(handoff);
+  CHECK(handoff.try_report_admission(
+      AdmissionResult{id, 0, ErrorCode::TokenizationFailed}));
+
+  g_fail_allocation_size.store(sizeof(RequestState),
+                               std::memory_order_release);
+  bool threw = false;
+  try {
+    scheduler.run_once();
+  } catch (const std::bad_alloc &) {
+    threw = true;
+  }
+  g_fail_allocation_size.store(0, std::memory_order_release);
+  CHECK(threw);
+  CHECK(scheduler.live_count() == 1);
+
+  scheduler.run_once();
+  CHECK(scheduler.live_count() == 0);
+  CHECK(scheduler.all_terminal());
+  CHECK(scheduler.requests().size() == 1);
+  CHECK(scheduler.requests().front().id == id);
+}
+
+void test_terminal_marker_allocation_failure_is_recovered() {
+  std::printf("test_terminal_marker_allocation_failure_is_recovered\n");
+  Handoff handoff(256, 3, 256);
+  ProbePolicy scheduler(handoff);
+  int observed = 0;
+  scheduler.enable_streaming_retirement(
+      [&](const RequestState &) noexcept {
+        ++observed;
+        return true;
+      });
+  constexpr int request_count = 140;
+  for (int i = 0; i < request_count; ++i) {
+    scheduler.submit("bad", 1);
+  }
+  scheduler.run_once();
+  for (int i = 0; i < request_count; ++i) {
+    const Admission admission = take_admission(handoff);
+    CHECK(handoff.try_report_admission(AdmissionResult{
+        admission.id, 0, ErrorCode::TokenizationFailed}));
+  }
+
+  g_fail_next_allocation.store(true, std::memory_order_release);
+  bool threw = false;
+  try {
+    scheduler.run_once();
+  } catch (const std::bad_alloc &) {
+    threw = true;
+  }
+  g_fail_allocation_size.store(0, std::memory_order_release);
+  g_fail_next_allocation.store(false, std::memory_order_release);
+  CHECK(threw);
+
+  while (!scheduler.all_terminal()) {
+    scheduler.run_once();
+  }
+  CHECK(observed == request_count);
+}
+
 } // namespace
 
 int main() {
+  test_workload_counts_distinguish_queued_and_active();
+  test_workload_counts_handle_burst_without_policy_scan();
+  test_workload_observer_reports_transitions_at_scheduler_clock();
   test_invalid_plans_are_never_published();
   test_exact_decode_range_is_publishable();
   test_work_for_non_schedulable_stages_is_rejected();
@@ -1114,6 +1628,7 @@ int main() {
   test_absolute_completions_are_idempotent_and_prefill_can_generate();
   test_output_is_appended_before_matching_completion_is_folded();
   test_eos_and_output_limit_release_then_ack_terminal();
+  test_trace_exact_latches_eog_and_continues_to_output_limit();
   test_release_retries_when_queue_is_full();
   test_outstanding_epoch_blocks_publication();
   test_retirement_racing_after_drain_never_republishes_stale_work();
@@ -1122,6 +1637,20 @@ int main() {
   test_request_stop_drains_and_run_requests_environment_stop();
   test_request_stop_waits_for_inflight_admission_resolution();
   test_request_stop_retries_owned_release_before_final_stop();
+  test_streaming_observer_waits_for_release_ack_and_retires();
+  test_streaming_observer_sees_unowned_rejection_once();
+  test_streaming_observer_preserves_terminal_message_order();
+  test_observer_failure_disables_observation_and_enters_draining();
+  test_injected_clock_drives_scheduler_timestamps();
+  test_injected_clock_records_each_generated_token_time();
+  test_cross_thread_request_stop_does_not_mutate_inspection_snapshot();
+  test_observer_may_submit_enough_requests_to_rehash_lookup();
+  test_throwing_clock_does_not_half_finish_unowned_rejection();
+  test_throwing_clock_does_not_half_finish_release_ack();
+  test_throwing_submit_clock_leaves_no_partial_request();
+  test_cross_thread_request_stop_wakes_replay_wait_without_handoff_stop();
+  test_history_copy_failure_retains_terminal_retirement_marker();
+  test_terminal_marker_allocation_failure_is_recovered();
 
   if (g_failures != 0) {
     std::printf("\n%d check(s) failed\n", g_failures);

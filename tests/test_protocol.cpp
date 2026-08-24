@@ -1,7 +1,9 @@
 #include "runtime/protocol.hpp"
+#include "runtime/environment.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <type_traits>
 
@@ -48,6 +50,8 @@ void test_messages_have_deterministic_defaults() {
   CHECK(admission.id == 0);
   CHECK(admission.prompt.empty());
   CHECK(admission.max_output_tokens == 0);
+  CHECK(!admission.synthetic_prompt_tokens.has_value());
+  CHECK(admission.output_mode == OutputMode::Natural);
 
   const AdmissionResult admission_result{};
   CHECK(admission_result.id == 0);
@@ -94,6 +98,16 @@ void test_all_error_codes_are_distinct() {
   CHECK(ErrorCode::ProtocolViolation != ErrorCode::EnvironmentStopped);
 }
 
+void test_synthetic_capacity_is_checked_before_materialization() {
+  std::printf("test_synthetic_capacity_is_checked_before_materialization\n");
+  CHECK(validate_synthetic_workload(
+            std::numeric_limits<std::uint32_t>::max(), 1, 256) ==
+        ErrorCode::ContextCapacityExceeded);
+  CHECK(validate_synthetic_workload(255, 1, 256) == ErrorCode::None);
+  CHECK(validate_synthetic_workload(256, 1, 256) ==
+        ErrorCode::ContextCapacityExceeded);
+}
+
 } // namespace
 
 int main() {
@@ -101,6 +115,7 @@ int main() {
   test_completion_stores_errors();
   test_messages_have_deterministic_defaults();
   test_all_error_codes_are_distinct();
+  test_synthetic_capacity_is_checked_before_materialization();
 
   if (g_failures != 0) {
     std::printf("\n%d check(s) failed\n", g_failures);

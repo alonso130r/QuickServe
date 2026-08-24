@@ -8,3 +8,8 @@ data/
 
 .DS_store
 
+docs/
+
+cmake/
+
+results/
