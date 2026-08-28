@@ -75,6 +75,17 @@ struct SchedulerWorkloadCounts {
   std::uint64_t queued = 0;
 };
 
+struct BatchOutcome {
+  std::uint64_t epoch = 0;
+  RequestState::TimePoint started_at{};
+  RequestState::TimePoint finished_at{};
+  RequestState::Clock::duration duration{};
+  std::uint32_t prefill_tokens = 0;
+  std::uint32_t decode_items = 0;
+  std::uint32_t work_items = 0;
+  bool success = true;
+};
+
 // Threading contract:
 // - submit() is called before the scheduler worker starts or by that same
 //   scheduler-owning thread during replay. It is never a concurrent operation.
@@ -115,6 +126,10 @@ public:
 
 protected:
   virtual void build_plan(Plan &out) = 0;
+  virtual void on_plan_completed(const BatchOutcome &) {}
+  [[nodiscard]] RequestState::TimePoint policy_now() const {
+    return current_time_;
+  }
   [[nodiscard]] const std::list<RequestState> &policy_requests() const {
     return live_requests_;
   }
@@ -159,6 +174,12 @@ private:
   bool terminal_marker_recovery_needed_ = false;
   std::uint64_t next_request_id_ = 0;
   std::uint64_t published_epoch_ = 0;
+  std::uint64_t observed_epoch_ = 0;
+  RequestState::TimePoint published_plan_start_{};
+  std::uint32_t published_prefill_tokens_ = 0;
+  std::uint32_t published_decode_items_ = 0;
+  std::uint32_t published_work_items_ = 0;
+  bool published_plan_success_ = true;
   std::atomic<bool> stop_requested_{false};
   bool draining_ = false;
   ErrorCode drain_error_ = ErrorCode::None;

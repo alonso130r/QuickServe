@@ -27,6 +27,8 @@ find_package(Threads REQUIRED)
 add_library(quickserve_runtime
     src/runtime/scheduler.cpp
     src/runtime/environment.cpp
+    src/runtime/model_profile.cpp
+    src/runtime/hardware_profile.cpp
 )
 
 target_link_libraries(quickserve_runtime PUBLIC

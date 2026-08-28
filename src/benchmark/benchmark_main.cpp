@@ -2,6 +2,7 @@
 #include "benchmark/results.hpp"
 #include "benchmark_policy_adapter.hpp"
 #include "runtime/environment.hpp"
+#include "runtime/hardware_profile.hpp"
 #include "llama.h"
 
 #include <atomic>
@@ -166,6 +167,12 @@ private:
 };
 
 int run(const Options &options) {
+  const std::optional<HardwareProfile> hardware_profile =
+      collect_macos_hardware_profile();
+  if (!hardware_profile) {
+    throw std::runtime_error("failed to collect macOS hardware profile");
+  }
+
   if (options.token_budget > options.batch_capacity)
     throw std::invalid_argument("token budget may not exceed batch capacity");
   qb::TraceReader reader(options.trace);
@@ -219,6 +226,9 @@ int run(const Options &options) {
   if (!startup.success) {
     throw std::runtime_error("model startup failed: " + startup.error);
   }
+  if (!startup.model_profile) {
+    throw std::runtime_error("model startup succeeded without a model profile");
+  }
 
   std::exception_ptr replay_error;
   std::uint64_t replay_wall_duration_ns = 0;
@@ -232,7 +242,9 @@ int run(const Options &options) {
       std::uint64_t last_submitted_source_offset = 0;
       bool output_ok = true;
       RequestState::TimePoint start{};
-      scheduler = quickserve_benchmark_adapter::create(handoff, options.token_budget);
+      scheduler = quickserve_benchmark_adapter::create(
+          handoff, options.token_budget, *startup.model_profile,
+          *hardware_profile);
       if (!scheduler) throw std::runtime_error("policy factory returned null");
       scheduler->set_clock(clock);
       scheduler->set_workload_observer([&](RequestState::TimePoint at,

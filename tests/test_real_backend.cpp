@@ -63,6 +63,22 @@ int main(int argc, char **argv) {
     environment_thread.join();
     return 1;
   }
+  CHECK(startup.model_profile.has_value());
+  if (startup.model_profile) {
+    const ModelProfile &profile = *startup.model_profile;
+    CHECK(profile.parameter_count > 0);
+    CHECK(profile.model_bytes > 0);
+    CHECK(profile.layer_count > 0);
+    CHECK(profile.embedding_dimension > 0);
+    CHECK(profile.attention_head_count > 0);
+    CHECK(profile.kv_head_count > 0);
+    CHECK(profile.head_dimension > 0);
+    CHECK(profile.embedding_dimension ==
+          profile.attention_head_count * profile.head_dimension);
+    CHECK(profile.context_capacity == 256);
+    CHECK(profile.batch_capacity == 64);
+    CHECK(profile.max_sequences == 1);
+  }
 
   std::thread scheduler_thread([&] {
     try {

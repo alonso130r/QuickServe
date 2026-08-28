@@ -65,6 +65,7 @@ public:
       : Scheduler(handoff, budget, std::move(clock)) {}
 
   std::vector<WorkItem> next_work;
+  std::vector<BatchOutcome> outcomes;
   int builds = 0;
 
   [[nodiscard]] RequestState::Stage live_stage(RequestId id) const {
@@ -81,6 +82,10 @@ public:
   }
 
 protected:
+  void on_plan_completed(const BatchOutcome &outcome) override {
+    outcomes.push_back(outcome);
+  }
+
   void build_plan(Plan &out) override {
     static_assert(std::is_const_v<std::remove_reference_t<
                       decltype(policy_requests())>>,
@@ -124,6 +129,43 @@ protected:
     }
   }
 };
+
+void test_policy_observes_completed_batch_once() {
+  Handoff handoff(8);
+  RequestState::TimePoint now{};
+  ProbePolicy scheduler(handoff, 32, [&] { return now; });
+  const RequestId id = scheduler.submit_synthetic(2, 2);
+
+  scheduler.run_once();
+  Admission admission{};
+  CHECK(handoff.try_take_admission(admission));
+  CHECK(handoff.try_report_admission({id, 2, ErrorCode::None}));
+  now += std::chrono::milliseconds(5);
+  scheduler.run_once();
+
+  Plan *plan = handoff.consume_plan();
+  CHECK(plan != nullptr);
+  CHECK(scheduler.outcomes.empty());
+  if (plan == nullptr) return;
+  CHECK(handoff.try_report_completion(
+      {id, 1, 0, 0, WorkKind::Prefill, ErrorCode::None, false, false}));
+  handoff.retire_plan(plan);
+
+  now += std::chrono::milliseconds(7);
+  scheduler.run_once();
+  CHECK(scheduler.outcomes.size() == 1);
+  if (scheduler.outcomes.size() == 1) {
+    const BatchOutcome &outcome = scheduler.outcomes.front();
+    CHECK(outcome.prefill_tokens == 1);
+    CHECK(outcome.decode_items == 0);
+    CHECK(outcome.work_items == 1);
+    CHECK(outcome.success);
+    CHECK(outcome.duration == std::chrono::milliseconds(7));
+  }
+
+  scheduler.run_once();
+  CHECK(scheduler.outcomes.size() == 1);
+}
 
 void test_workload_counts_distinguish_queued_and_active() {
   Handoff handoff(8);
@@ -1606,6 +1648,7 @@ void test_terminal_marker_allocation_failure_is_recovered() {
 } // namespace
 
 int main() {
+  test_policy_observes_completed_batch_once();
   test_workload_counts_distinguish_queued_and_active();
   test_workload_counts_handle_burst_without_policy_scan();
   test_workload_observer_reports_transitions_at_scheduler_clock();

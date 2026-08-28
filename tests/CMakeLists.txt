@@ -16,6 +16,27 @@ endfunction()
 add_executable(test_protocol test_protocol.cpp)
 configure_model_free_test(test_protocol protocol)
 
+add_executable(test_model_profile
+    test_model_profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/model_profile.cpp
+)
+configure_model_free_test(test_model_profile model_profile)
+
+add_executable(test_hardware_profile
+    test_hardware_profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/hardware_profile.cpp
+)
+configure_model_free_test(test_hardware_profile hardware_profile)
+
+add_executable(test_heuristic_aimd
+    test_heuristic_aimd.cpp
+    ${CMAKE_SOURCE_DIR}/src/policies/heuristic_aimd.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/scheduler.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/model_profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/hardware_profile.cpp
+)
+configure_model_free_test(test_heuristic_aimd heuristic_aimd)
+
 add_executable(test_trace
     test_trace.cpp
     ${CMAKE_SOURCE_DIR}/src/benchmark/trace.cpp

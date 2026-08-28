@@ -125,6 +125,22 @@ bool Scheduler::run_once() {
   retry_releases();
   retire_terminal_requests();
 
+  if (plan_done && published_epoch_ != 0 &&
+      observed_epoch_ < published_epoch_) {
+    const BatchOutcome outcome{
+        published_epoch_,
+        published_plan_start_,
+        current_time_,
+        current_time_ - published_plan_start_,
+        published_prefill_tokens_,
+        published_decode_items_,
+        published_work_items_,
+        published_plan_success_,
+    };
+    observed_epoch_ = published_epoch_;
+    on_plan_completed(outcome);
+  }
+
   if (all_terminal()) {
     return finish_iteration(false);
   }
@@ -157,7 +173,18 @@ bool Scheduler::run_once() {
       const std::uint64_t published_epoch = handoff_.commit();
       if (published_epoch != 0) {
         published_epoch_ = published_epoch;
+        published_plan_start_ = start_time;
+        published_prefill_tokens_ = 0;
+        published_decode_items_ = 0;
+        published_work_items_ =
+            static_cast<std::uint32_t>(plan.work.size());
+        published_plan_success_ = true;
         for (const WorkItem &work : plan.work) {
+          if (work.kind == WorkKind::Prefill) {
+            published_prefill_tokens_ += work.token_count();
+          } else {
+            ++published_decode_items_;
+          }
           RequestState *state = find_request(work.id);
           if (state != nullptr && !state->start_recorded) {
             state->start_time = start_time;
@@ -311,6 +338,9 @@ void Scheduler::drain_completions() {
       continue;
     }
     RequestState &state = *found;
+    if (completion.error != ErrorCode::None) {
+      published_plan_success_ = false;
+    }
     if (state.stage == RequestState::Stage::Terminal ||
         state.admission !=
             RequestState::AdmissionOwnership::EnvironmentOwned) {
@@ -378,6 +408,7 @@ void Scheduler::drain_release_acks() {
 void Scheduler::drain_fatals() {
   RunFatal fatal{};
   while (handoff_.try_take_fatal(fatal)) {
+    published_plan_success_ = false;
     enter_draining(fatal.error == ErrorCode::None
                        ? ErrorCode::EnvironmentStopped
                        : fatal.error);

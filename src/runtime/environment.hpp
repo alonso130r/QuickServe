@@ -3,9 +3,11 @@
 #include <cstdint>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "handoff.hpp"
+#include "model_profile.hpp"
 
 struct EnvironmentConfig {
   std::string model_path;
@@ -17,6 +19,7 @@ struct EnvironmentConfig {
 struct EnvironmentStartupResult {
   bool success = false;
   std::string error;
+  std::optional<ModelProfile> model_profile;
 };
 
 [[nodiscard]] constexpr ErrorCode validate_synthetic_workload(
