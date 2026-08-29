@@ -200,6 +200,43 @@ bool AtomicResults::observe(const RequestMetrics &m) noexcept {
   } catch (...) { return false; }
 }
 
+bool AtomicResults::observe_batch(std::uint32_t prefill_tokens,
+                                  std::uint32_t decode_items,
+                                  std::uint64_t duration_ns,
+                                  bool success) noexcept {
+  try {
+    ++batch_count_;
+    if (!success) ++failed_batches_;
+    batch_prefill_tokens_ += prefill_tokens;
+    batch_decode_items_ += decode_items;
+    batch_duration_sum_ += duration_ns;
+    if (prefill_tokens != 0) {
+      ++prefill_batch_count_;
+      if (prefill_batch_count_ == 1) {
+        minimum_prefill_tokens_ = maximum_prefill_tokens_ = prefill_tokens;
+      } else {
+        minimum_prefill_tokens_ =
+            std::min(minimum_prefill_tokens_, prefill_tokens);
+        maximum_prefill_tokens_ =
+            std::max(maximum_prefill_tokens_, prefill_tokens);
+      }
+    }
+    if (prefill_tokens != 0 && decode_items != 0) {
+      ++mixed_batches_;
+      mixed_duration_sum_ += duration_ns;
+    } else if (prefill_tokens != 0) {
+      ++pure_prefill_batches_;
+      pure_prefill_duration_sum_ += duration_ns;
+    } else if (decode_items != 0) {
+      ++pure_decode_batches_;
+      pure_decode_duration_sum_ += duration_ns;
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 void AtomicResults::sample_counts(std::uint64_t now_ns, std::uint64_t active,
                                   std::uint64_t queued) {
   if (now_ns < count_last_time_) throw std::invalid_argument("count sample time decreased");
@@ -287,6 +324,27 @@ void AtomicResults::finish(std::uint64_t wall_duration_ns) {
     << "\"mean_queued_requests\":" << nullable(queued_integral_ / std::max<std::uint64_t>(1, wall_duration_ns), wall_duration_ns != 0) << ','
     << "\"peak_active_requests\":" << peak_active_ << ',' << "\"peak_queued_requests\":" << peak_queued_ << ','
     << "\"jain_fairness\":" << nullable(fairness, fairness_count_ != 0 && fairness_square_sum_ != 0) << ',';
+  summary << "\"batches\":{"
+    << "\"total\":" << batch_count_ << ','
+    << "\"pure_prefill\":" << pure_prefill_batches_ << ','
+    << "\"pure_decode\":" << pure_decode_batches_ << ','
+    << "\"mixed\":" << mixed_batches_ << ','
+    << "\"failed\":" << failed_batches_ << ','
+    << "\"prefill_tokens\":" << batch_prefill_tokens_ << ','
+    << "\"decode_items\":" << batch_decode_items_ << ','
+    << "\"prefill_tokens_per_batch\":{"
+    << "\"mean\":" << nullable(
+           static_cast<long double>(batch_prefill_tokens_) /
+               std::max<std::uint64_t>(1, prefill_batch_count_),
+           prefill_batch_count_ != 0)
+    << ",\"min\":" << (prefill_batch_count_ ? std::to_string(minimum_prefill_tokens_) : "null")
+    << ",\"max\":" << (prefill_batch_count_ ? std::to_string(maximum_prefill_tokens_) : "null") << "},"
+    << "\"mean_duration_ns\":{"
+    << "\"all\":" << nullable(batch_duration_sum_ / std::max<std::uint64_t>(1, batch_count_), batch_count_ != 0)
+    << ",\"pure_prefill\":" << nullable(pure_prefill_duration_sum_ / std::max<std::uint64_t>(1, pure_prefill_batches_), pure_prefill_batches_ != 0)
+    << ",\"pure_decode\":" << nullable(pure_decode_duration_sum_ / std::max<std::uint64_t>(1, pure_decode_batches_), pure_decode_batches_ != 0)
+    << ",\"mixed\":" << nullable(mixed_duration_sum_ / std::max<std::uint64_t>(1, mixed_batches_), mixed_batches_ != 0)
+    << "}},";
   emit_sketch("arrival_lag", arrival_lag_); summary << ',';
   emit_sketch("queue_delay", queue_delay_); summary << ',';
   emit_sketch("ttft", ttft_); summary << ',';

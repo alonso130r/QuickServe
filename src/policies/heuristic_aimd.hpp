@@ -12,7 +12,7 @@
 #include <vector>
 
 struct HeuristicAIMDConfig {
-  double initial_window = 32.0;
+  double initial_window = 512.0;
   double minimum_window = 16.0;
   double maximum_window = 512.0;
   double additive_step = 16.0;
@@ -91,7 +91,6 @@ private:
   const HeuristicAIMDConfig config_;
   double prefill_window_ = 1.0;
   double decode_window_ = 1.0;
-  std::optional<double> prefill_time_per_token_ewma_;
   std::optional<double> decode_time_per_item_ewma_;
   BatchEstimate last_estimate_{};
   std::unordered_map<RequestId, std::uint32_t> bypasses_;

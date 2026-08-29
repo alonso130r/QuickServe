@@ -65,6 +65,7 @@ void HeuristicAIMD::update_window(double sample, std::optional<double> &ewma,
                       config_.minimum_window);
     return;
   }
+  if (!std::isfinite(sample) || sample <= 0.0) return;
   if (!ewma) {
     ewma = sample;
     return;
@@ -83,12 +84,6 @@ void HeuristicAIMD::update_window(double sample, std::optional<double> &ewma,
 
 void HeuristicAIMD::on_plan_completed(const BatchOutcome &outcome) {
   const double elapsed_ns = static_cast<double>(outcome.duration.count());
-  if (outcome.prefill_tokens != 0 &&
-      (outcome.decode_items == 0 || !outcome.success)) {
-    update_window(elapsed_ns / outcome.prefill_tokens,
-                  prefill_time_per_token_ewma_, prefill_window_,
-                  outcome.success);
-  }
   if (outcome.decode_items != 0 &&
       (outcome.prefill_tokens == 0 || !outcome.success)) {
     update_window(elapsed_ns / outcome.decode_items,
@@ -246,9 +241,16 @@ void HeuristicAIMD::build_plan(Plan &out) {
     return utility(a) > utility(b);
   };
   std::stable_sort(decode.begin(), decode.end(), more_useful);
-  std::stable_sort(prefill.begin(), prefill.end(), [](const Candidate &a,
-                                                      const Candidate &b) {
-    if (a.bypasses != b.bypasses) return a.bypasses > b.bypasses;
+  std::stable_sort(prefill.begin(), prefill.end(), [&](const Candidate &a,
+                                                       const Candidate &b) {
+    const bool a_starved = a.bypasses >= config_.starvation_threshold;
+    const bool b_starved = b.bypasses >= config_.starvation_threshold;
+    if (a_starved != b_starved) return a_starved;
+    if (a_starved && a.bypasses != b.bypasses)
+      return a.bypasses > b.bypasses;
+    const bool a_started = a.work.token_begin != 0;
+    const bool b_started = b.work.token_begin != 0;
+    if (a_started != b_started) return a_started;
     return a.urgency > b.urgency;
   });
 

@@ -241,6 +241,9 @@ void test_csv_and_summary_are_valid() {
   rejected.disposition = "admission_rejection";
   const bool observed_rejection = results.observe(rejected);
   CHECK(observed_rejection);
+  CHECK(results.observe_batch(8, 0, 100, true));
+  CHECK(results.observe_batch(4, 2, 200, true));
+  CHECK(results.observe_batch(0, 2, 50, false));
   results.finish(100);
   CHECK(std::filesystem::exists(root / "requests.csv"));
   CHECK(std::filesystem::exists(root / "summary.json"));
@@ -263,6 +266,20 @@ void test_csv_and_summary_are_valid() {
   CHECK(text.find("\"executed_input_tokens\":4") != std::string::npos);
   CHECK(text.find("\"jain_fairness\":1") != std::string::npos);
   CHECK(text.find("\"failure_request_rate\"") != std::string::npos);
+  CHECK(text.find("\"batches\":{\"total\":3") != std::string::npos);
+  CHECK(text.find("\"pure_prefill\":1") != std::string::npos);
+  CHECK(text.find("\"pure_decode\":1") != std::string::npos);
+  CHECK(text.find("\"mixed\":1") != std::string::npos);
+  CHECK(text.find("\"failed\":1") != std::string::npos);
+  CHECK(text.find("\"prefill_tokens\":12") != std::string::npos);
+  CHECK(text.find("\"decode_items\":4") != std::string::npos);
+  CHECK(text.find("\"prefill_tokens_per_batch\":{"
+                  "\"mean\":6,\"min\":4,\"max\":8}") !=
+        std::string::npos);
+  CHECK(text.find("\"mean_duration_ns\":{"
+                  "\"all\":116.66666666666667,\"pure_prefill\":100,"
+                  "\"pure_decode\":50,\"mixed\":200}") !=
+        std::string::npos);
   CHECK(text.find("\"rejection_request_rate\"") != std::string::npos);
   CHECK(text.find("\"1_512\":{\"count\":2,\"success\":1,\"failure\":0,\"rejection\":1") != std::string::npos);
   CHECK(text.find("\"mean_ttft_ns\":null") != std::string::npos);

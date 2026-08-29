@@ -99,6 +99,7 @@ public:
   using TerminalObserver = std::function<bool(const RequestState &)>;
   using WorkloadObserver =
       std::function<void(RequestState::TimePoint, SchedulerWorkloadCounts)>;
+  using BatchObserver = std::function<void(const BatchOutcome &)>;
 
   explicit Scheduler(Handoff &handoff, std::uint32_t token_budget,
                      ClockFunction clock = {});
@@ -115,6 +116,7 @@ public:
                              OutputMode output_mode = OutputMode::Natural);
   void enable_streaming_retirement(TerminalObserver observer);
   void set_workload_observer(WorkloadObserver observer);
+  void set_batch_observer(BatchObserver observer);
   void set_clock(ClockFunction clock);
   bool run_once();
   void run();
@@ -191,6 +193,7 @@ private:
   bool observer_enabled_ = false;
   bool execution_started_ = false;
   WorkloadObserver workload_observer_;
+  BatchObserver batch_observer_;
   SchedulerWorkloadCounts last_published_counts_{};
   SchedulerWorkloadCounts workload_counts_{};
   std::thread::id scheduler_thread_{};

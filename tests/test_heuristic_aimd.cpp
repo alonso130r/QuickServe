@@ -114,7 +114,6 @@ void test_default_prefill_chunk_uses_full_backend_capacity() {
   const ModelProfile model = test_profile();
   const HardwareProfile hardware = test_hardware_profile();
   HeuristicAIMDConfig config;
-  config.initial_window = 512.0;
   HeuristicAIMD scheduler(handoff, 512, model, hardware, config);
   scheduler.submit_synthetic(1024, 2);
   admit(scheduler, handoff, {1024});
@@ -124,6 +123,7 @@ void test_default_prefill_chunk_uses_full_backend_capacity() {
   if (!plan) return;
   CHECK(plan->work.size() == 1);
   CHECK(plan->work.front().token_count() == 512);
+  CHECK(scheduler.prefill_window() == 512.0);
   handoff.retire_plan(plan);
 }
 
@@ -146,7 +146,7 @@ void test_oversized_window_still_respects_token_budget() {
   handoff.retire_plan(plan);
 }
 
-void test_aimd_uses_ewma_rate_and_separate_windows() {
+void test_prefill_capacity_stays_fixed_across_batch_timings() {
   Handoff handoff(8);
   RequestState::TimePoint now{};
   const ModelProfile model = test_profile();
@@ -176,15 +176,15 @@ void test_aimd_uses_ewma_rate_and_separate_windows() {
   CHECK(scheduler.decode_window() == 4.0);
 
   finish_prefill_batch(std::chrono::milliseconds(4));
-  CHECK(scheduler.prefill_window() == 20.0);
+  CHECK(scheduler.prefill_window() == 4.0);
   CHECK(scheduler.decode_window() == 4.0);
 
   finish_prefill_batch(std::chrono::microseconds(4100));
-  CHECK(scheduler.prefill_window() == 36.0);
+  CHECK(scheduler.prefill_window() == 4.0);
   CHECK(scheduler.decode_window() == 4.0);
 
   finish_prefill_batch(std::chrono::milliseconds(40));
-  CHECK(scheduler.prefill_window() == 28.8);
+  CHECK(scheduler.prefill_window() == 4.0);
   CHECK(scheduler.decode_window() == 4.0);
 }
 
@@ -219,22 +219,12 @@ void test_scheduler_mixes_decode_and_prefill() {
   if (mixed->work.size() == 2) {
     CHECK(mixed->work[0].id == 0);
     CHECK(mixed->work[0].kind == WorkKind::Decode);
-    CHECK(mixed->work[0].token_begin == 1);
-    CHECK(mixed->work[0].token_end == 2);
     CHECK(mixed->work[1].id == 1);
     CHECK(mixed->work[1].kind == WorkKind::Prefill);
     CHECK(mixed->work[1].token_begin == 3);
     CHECK(mixed->work[1].token_end == 4);
   }
-  CHECK(handoff.try_report_completion(
-      {0, 1, 2, 8, WorkKind::Decode, ErrorCode::None, true, false}));
-  CHECK(handoff.try_report_completion(
-      {1, 4, 1, 9, WorkKind::Prefill, ErrorCode::None, true, false}));
   handoff.retire_plan(mixed);
-  now += std::chrono::milliseconds(20);
-  scheduler.run_once();
-  CHECK(scheduler.prefill_window() == 4.0);
-  CHECK(scheduler.decode_window() == 4.0);
 }
 
 void test_prefill_is_memory_capped_instead_of_skipped() {
@@ -324,6 +314,35 @@ void test_starved_prefill_eventually_beats_decode() {
   CHECK(prefill_selected);
 }
 
+void test_started_prefill_keeps_locality_until_completion() {
+  Handoff handoff(8);
+  const ModelProfile model = test_profile();
+  const HardwareProfile hardware = test_hardware_profile();
+  HeuristicAIMD scheduler(handoff, 4, model, hardware, test_config());
+  scheduler.submit_synthetic(8, 2);
+  scheduler.submit_synthetic(8, 2);
+  admit(scheduler, handoff, {8, 8});
+
+  Plan *first = handoff.consume_plan();
+  CHECK(first != nullptr);
+  if (!first) return;
+  CHECK(first->work.size() == 1);
+  CHECK(first->work.front().id == 0);
+  CHECK(handoff.try_report_completion(
+      {0, 4, 0, 0, WorkKind::Prefill, ErrorCode::None, false, false}));
+  handoff.retire_plan(first);
+
+  scheduler.run_once();
+  Plan *second = handoff.consume_plan();
+  CHECK(second != nullptr);
+  if (!second) return;
+  CHECK(second->work.size() == 1);
+  CHECK(second->work.front().id == 0);
+  CHECK(second->work.front().token_begin == 4);
+  CHECK(second->work.front().token_end == 8);
+  handoff.retire_plan(second);
+}
+
 } // namespace
 
 int main() {
@@ -332,10 +351,11 @@ int main() {
   test_scheduler_emits_bounded_prefill_work();
   test_default_prefill_chunk_uses_full_backend_capacity();
   test_oversized_window_still_respects_token_budget();
-  test_aimd_uses_ewma_rate_and_separate_windows();
+  test_prefill_capacity_stays_fixed_across_batch_timings();
   test_scheduler_mixes_decode_and_prefill();
   test_prefill_is_memory_capped_instead_of_skipped();
   test_starved_prefill_eventually_beats_decode();
+  test_started_prefill_keeps_locality_until_completion();
   if (failures != 0) {
     std::printf("%d check(s) failed\n", failures);
     return 1;

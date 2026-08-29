@@ -134,6 +134,9 @@ void test_policy_observes_completed_batch_once() {
   Handoff handoff(8);
   RequestState::TimePoint now{};
   ProbePolicy scheduler(handoff, 32, [&] { return now; });
+  std::vector<BatchOutcome> observed;
+  scheduler.set_batch_observer(
+      [&](const BatchOutcome &outcome) { observed.push_back(outcome); });
   const RequestId id = scheduler.submit_synthetic(2, 2);
 
   scheduler.run_once();
@@ -154,6 +157,7 @@ void test_policy_observes_completed_batch_once() {
   now += std::chrono::milliseconds(7);
   scheduler.run_once();
   CHECK(scheduler.outcomes.size() == 1);
+  CHECK(observed.size() == 1);
   if (scheduler.outcomes.size() == 1) {
     const BatchOutcome &outcome = scheduler.outcomes.front();
     CHECK(outcome.prefill_tokens == 1);
@@ -165,6 +169,7 @@ void test_policy_observes_completed_batch_once() {
 
   scheduler.run_once();
   CHECK(scheduler.outcomes.size() == 1);
+  CHECK(observed.size() == 1);
 }
 
 void test_workload_counts_distinguish_queued_and_active() {

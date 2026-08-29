@@ -83,6 +83,9 @@ public:
   ~AtomicResults();
   void begin(const RunMetadata &metadata);
   bool observe(const RequestMetrics &metrics) noexcept;
+  bool observe_batch(std::uint32_t prefill_tokens,
+                     std::uint32_t decode_items,
+                     std::uint64_t duration_ns, bool success) noexcept;
   void sample_counts(std::uint64_t now_ns, std::uint64_t active,
                      std::uint64_t queued);
   void finish(std::uint64_t wall_duration_ns);
@@ -127,6 +130,20 @@ private:
   long double queued_integral_{};
   std::uint64_t peak_active_{};
   std::uint64_t peak_queued_{};
+  std::uint64_t batch_count_{};
+  std::uint64_t pure_prefill_batches_{};
+  std::uint64_t pure_decode_batches_{};
+  std::uint64_t mixed_batches_{};
+  std::uint64_t failed_batches_{};
+  std::uint64_t batch_prefill_tokens_{};
+  std::uint64_t batch_decode_items_{};
+  std::uint64_t prefill_batch_count_{};
+  std::uint32_t minimum_prefill_tokens_{};
+  std::uint32_t maximum_prefill_tokens_{};
+  long double batch_duration_sum_{};
+  long double pure_prefill_duration_sum_{};
+  long double pure_decode_duration_sum_{};
+  long double mixed_duration_sum_{};
   bool begun_{};
   bool finished_{};
 };

@@ -251,6 +251,16 @@ int run(const Options &options) {
                                             SchedulerWorkloadCounts counts) {
         results.sample_counts(ns_since(start, at), counts.active, counts.queued);
       });
+      scheduler->set_batch_observer([&](const BatchOutcome &outcome) {
+        const auto duration = std::max(
+            RequestState::Clock::duration::zero(), outcome.duration);
+        output_ok = output_ok && results.observe_batch(
+            outcome.prefill_tokens, outcome.decode_items,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(duration)
+                    .count()),
+            outcome.success);
+      });
       scheduler->enable_streaming_retirement([&](const RequestState &state) {
         try {
           const auto found = active_metadata.find(state.id);

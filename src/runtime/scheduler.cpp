@@ -88,6 +88,12 @@ void Scheduler::set_workload_observer(WorkloadObserver observer) {
   workload_observer_ = std::move(observer);
 }
 
+void Scheduler::set_batch_observer(BatchObserver observer) {
+  if (execution_started_)
+    throw std::logic_error("batch observer must be set before execution");
+  batch_observer_ = std::move(observer);
+}
+
 void Scheduler::set_clock(ClockFunction clock) {
   if (execution_started_ || !live_requests_.empty())
     throw std::logic_error("clock must be set before execution");
@@ -139,6 +145,7 @@ bool Scheduler::run_once() {
     };
     observed_epoch_ = published_epoch_;
     on_plan_completed(outcome);
+    if (batch_observer_) batch_observer_(outcome);
   }
 
   if (all_terminal()) {
