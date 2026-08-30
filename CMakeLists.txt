@@ -21,6 +21,39 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 
+# Homebrew's libomp is keg-only, so Apple Clang cannot discover it through the
+# default include and library paths. Seed FindOpenMP's cache inputs when the
+# runtime is available, while leaving other compilers and platforms untouched.
+if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    find_program(QUICKSERVE_BREW_EXECUTABLE brew)
+    if(QUICKSERVE_BREW_EXECUTABLE)
+        execute_process(
+            COMMAND "${QUICKSERVE_BREW_EXECUTABLE}" --prefix libomp
+            OUTPUT_VARIABLE QUICKSERVE_LIBOMP_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+            RESULT_VARIABLE QUICKSERVE_LIBOMP_PREFIX_RESULT)
+    endif()
+
+    if(QUICKSERVE_LIBOMP_PREFIX_RESULT EQUAL 0 AND
+       EXISTS "${QUICKSERVE_LIBOMP_PREFIX}/include/omp.h" AND
+       EXISTS "${QUICKSERVE_LIBOMP_PREFIX}/lib/libomp.dylib")
+        set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp" CACHE STRING "" FORCE)
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp" CACHE STRING "" FORCE)
+        set(OpenMP_C_LIB_NAMES omp CACHE STRING "" FORCE)
+        set(OpenMP_CXX_LIB_NAMES omp CACHE STRING "" FORCE)
+        set(OpenMP_omp_LIBRARY
+            "${QUICKSERVE_LIBOMP_PREFIX}/lib/libomp.dylib"
+            CACHE FILEPATH "" FORCE)
+        set(OpenMP_C_INCLUDE_DIR
+            "${QUICKSERVE_LIBOMP_PREFIX}/include"
+            CACHE PATH "" FORCE)
+        set(OpenMP_CXX_INCLUDE_DIR
+            "${QUICKSERVE_LIBOMP_PREFIX}/include"
+            CACHE PATH "" FORCE)
+    endif()
+endif()
+
 add_subdirectory(external/llama.cpp)
 find_package(Threads REQUIRED)
 
