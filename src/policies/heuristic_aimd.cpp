@@ -24,6 +24,7 @@ void validate(const HeuristicAIMDConfig &config) {
       config.ttft_target <= std::chrono::nanoseconds::zero() ||
       config.tpot_target <= std::chrono::nanoseconds::zero() ||
       config.starvation_threshold == 0 ||
+      config.max_consecutive_decode_batches == 0 ||
       config.max_prefill_chunk == 0) {
     throw std::invalid_argument("invalid heuristic AIMD configuration");
   }
@@ -160,72 +161,47 @@ double HeuristicAIMD::utility(const Candidate &candidate) const {
   return value;
 }
 
-long double
-HeuristicAIMD::additional_kv_bytes(const Candidate &candidate) const {
+BatchFeasibility HeuristicAIMD::check_feasibility(
+    const std::vector<Candidate> &selected) const {
+  BatchFeasibility result{};
   const long double kv_dimension =
       static_cast<long double>(model_profile_.kv_head_count) *
       model_profile_.head_dimension;
   const long double kv_scalar_bytes =
       model_profile_.key_effective_bytes_per_scalar +
       model_profile_.value_effective_bytes_per_scalar;
-  const std::uint32_t tokens = candidate.work.kind == WorkKind::Prefill
-                                   ? candidate.work.token_count()
-                                   : 1;
-  return static_cast<long double>(model_profile_.layer_count) * kv_dimension *
-         kv_scalar_bytes * tokens;
-}
+  const long double kv_bytes_per_token =
+      static_cast<long double>(model_profile_.layer_count) * kv_dimension *
+      kv_scalar_bytes;
 
-BatchEstimate
-HeuristicAIMD::estimate(const std::vector<Candidate> &selected) const {
-  BatchEstimate result{};
-  if (selected.empty()) return result;
-
-  std::uint64_t tokens = 0;
-  const long double parameter_count = model_profile_.parameter_count;
-  const long double layers = model_profile_.layer_count;
-  const long double embedding = model_profile_.embedding_dimension;
-  const long double kv_dimension =
-      static_cast<long double>(model_profile_.kv_head_count) *
-      model_profile_.head_dimension;
-  const long double kv_scalar_bytes =
-      model_profile_.key_effective_bytes_per_scalar +
-      model_profile_.value_effective_bytes_per_scalar;
-
-  result.memory_bytes = model_profile_.model_bytes;
-  for (const Candidate &candidate : selected) {
-    const std::uint32_t count = candidate.work.token_count();
-    tokens += count;
-    result.compute_operations += 2.0L * parameter_count * count;
-    if (candidate.work.kind == WorkKind::Prefill) {
-      result.compute_operations +=
-          4.0L * layers * embedding * count * candidate.context_length;
-      const long double kv_write =
-          layers * kv_dimension * kv_scalar_bytes * count;
-      result.memory_bytes += kv_write;
-      result.additional_kv_bytes += kv_write;
-    } else {
-      result.compute_operations +=
-          4.0L * layers * embedding * candidate.context_length;
-      result.memory_bytes += layers * kv_dimension * kv_scalar_bytes *
-                             candidate.context_length;
-      result.additional_kv_bytes +=
-          layers * kv_dimension * kv_scalar_bytes;
+  std::uint64_t resident_tokens = 0;
+  for (const RequestState &request : policy_requests()) {
+    if (request.stage != RequestState::Stage::Prefill &&
+        request.stage != RequestState::Stage::Decode) {
+      continue;
     }
+    resident_tokens += request.prefill_position;
+    if (request.decoded_count > 0) resident_tokens += request.decoded_count - 1;
   }
-
-  result.compute_pressure =
-      result.compute_operations / (2.0L * parameter_count);
-  result.bandwidth_pressure =
-      result.additional_kv_bytes /
-      static_cast<long double>(hardware_profile_.total_memory_bytes);
-  result.pressure = static_cast<double>(
-      std::max(result.compute_pressure, result.bandwidth_pressure));
-  result.valid = tokens <= token_budget_ &&
-                 std::isfinite(result.compute_operations) &&
-                 std::isfinite(result.memory_bytes) &&
-                 std::isfinite(result.additional_kv_bytes) &&
-                 result.additional_kv_bytes <=
-                     static_cast<long double>(hardware_profile_.total_memory_bytes);
+  for (const Candidate &candidate : selected) {
+    result.total_tokens += candidate.work.token_count();
+    resident_tokens += candidate.work.kind == WorkKind::Prefill
+                           ? candidate.work.token_count()
+                           : 1;
+  }
+  result.work_items = selected.size();
+  result.resident_kv_bytes = kv_bytes_per_token * resident_tokens;
+  result.required_memory_bytes =
+      static_cast<long double>(model_profile_.model_bytes) +
+      result.resident_kv_bytes;
+  result.valid =
+      result.total_tokens <= token_budget_ &&
+      result.total_tokens <= model_profile_.batch_capacity &&
+      result.work_items <= model_profile_.max_sequences &&
+      std::isfinite(result.resident_kv_bytes) &&
+      std::isfinite(result.required_memory_bytes) &&
+      result.required_memory_bytes <=
+          static_cast<long double>(hardware_profile_.total_memory_bytes);
   return result;
 }
 
@@ -237,10 +213,11 @@ void HeuristicAIMD::build_plan(Plan &out) {
     (candidate.work.kind == WorkKind::Decode ? decode : prefill)
         .push_back(candidate);
   }
-  const auto more_useful = [&](const Candidate &a, const Candidate &b) {
-    return utility(a) > utility(b);
-  };
-  std::stable_sort(decode.begin(), decode.end(), more_useful);
+  std::stable_sort(decode.begin(), decode.end(), [](const Candidate &a,
+                                                    const Candidate &b) {
+    if (a.urgency != b.urgency) return a.urgency > b.urgency;
+    return a.bypasses > b.bypasses;
+  });
   std::stable_sort(prefill.begin(), prefill.end(), [&](const Candidate &a,
                                                        const Candidate &b) {
     const bool a_starved = a.bypasses >= config_.starvation_threshold;
@@ -258,61 +235,52 @@ void HeuristicAIMD::build_plan(Plan &out) {
   std::uint32_t remaining_tokens = token_budget_;
   std::uint32_t remaining_decode = window_capacity(decode_window_);
   std::uint32_t remaining_prefill = window_capacity(prefill_window_);
-  long double selected_kv_bytes = 0.0L;
+  const bool prefill_starved =
+      std::any_of(prefill.begin(), prefill.end(), [&](const Candidate &item) {
+        return item.bypasses >= config_.starvation_threshold;
+      });
+  const bool force_prefill =
+      !prefill.empty() &&
+      (prefill_starved || consecutive_decode_batches_ >=
+                              config_.max_consecutive_decode_batches);
+  const bool decode_mode = !decode.empty() && !force_prefill;
 
-  for (const Candidate &candidate : decode) {
-    if (remaining_tokens == 0 || remaining_decode == 0) break;
-    const long double incremental_kv = additional_kv_bytes(candidate);
-    if (!std::isfinite(incremental_kv) ||
-        selected_kv_bytes + incremental_kv >
-            static_cast<long double>(hardware_profile_.total_memory_bytes)) {
-      continue;
+  if (decode_mode) {
+    for (const Candidate &candidate : decode) {
+      if (remaining_tokens == 0 || remaining_decode == 0) break;
+      std::vector<Candidate> proposed = selected;
+      proposed.push_back(candidate);
+      if (!check_feasibility(proposed).valid) continue;
+      selected.push_back(candidate);
+      --remaining_tokens;
+      --remaining_decode;
     }
-    selected_kv_bytes += incremental_kv;
-    selected.push_back(candidate);
-    --remaining_tokens;
-    --remaining_decode;
-  }
-
-  for (Candidate candidate : prefill) {
-    if (remaining_tokens == 0 || remaining_prefill == 0) break;
-    const long double kv_per_token =
-        additional_kv_bytes(candidate) / candidate.work.token_count();
-    const long double remaining_memory =
-        static_cast<long double>(hardware_profile_.total_memory_bytes) -
-        selected_kv_bytes;
-    if (!std::isfinite(kv_per_token) || kv_per_token <= 0.0L ||
-        remaining_memory < kv_per_token) {
-      continue;
+  } else {
+    for (Candidate candidate : prefill) {
+      if (remaining_tokens == 0 || remaining_prefill == 0) break;
+      std::uint32_t count = std::min(
+          {candidate.work.token_count(), remaining_tokens, remaining_prefill});
+      while (count > 0) {
+        candidate.work.token_end = candidate.work.token_begin + count;
+        candidate.context_length = candidate.work.token_end;
+        std::vector<Candidate> proposed = selected;
+        proposed.push_back(candidate);
+        if (check_feasibility(proposed).valid) break;
+        --count;
+      }
+      if (count == 0) continue;
+      selected.push_back(candidate);
+      remaining_tokens -= count;
+      remaining_prefill -= count;
     }
-    const long double memory_capacity = remaining_memory / kv_per_token;
-    constexpr auto maximum_count =
-        std::numeric_limits<std::uint32_t>::max();
-    const std::uint32_t memory_tokens =
-        memory_capacity >= static_cast<long double>(maximum_count)
-            ? maximum_count
-            : static_cast<std::uint32_t>(memory_capacity);
-    const std::uint32_t count =
-        std::min({candidate.work.token_count(), remaining_tokens,
-                  remaining_prefill, memory_tokens});
-    candidate.work.token_end = candidate.work.token_begin + count;
-    candidate.context_length = candidate.work.token_end;
-    const long double incremental_kv = additional_kv_bytes(candidate);
-    if (!std::isfinite(incremental_kv) ||
-        selected_kv_bytes + incremental_kv >
-            static_cast<long double>(hardware_profile_.total_memory_bytes)) {
-      continue;
-    }
-    selected_kv_bytes += incremental_kv;
-    selected.push_back(candidate);
-    remaining_tokens -= count;
-    remaining_prefill -= count;
   }
 
   if (selected.empty() && !available.empty()) {
+    const std::vector<Candidate> &mode_candidates =
+        decode_mode ? decode : prefill;
     Candidate fallback = *std::max_element(
-        available.begin(), available.end(), [&](const Candidate &a,
-                                                 const Candidate &b) {
+        mode_candidates.begin(), mode_candidates.end(), [&](const Candidate &a,
+                                                             const Candidate &b) {
           return utility(a) < utility(b);
         });
     if (fallback.work.kind == WorkKind::Prefill) {
@@ -344,10 +312,18 @@ void HeuristicAIMD::build_plan(Plan &out) {
     }
   }
 
-  last_estimate_ = estimate(selected);
-  if (!last_estimate_.valid) return;
+  last_feasibility_ = check_feasibility(selected);
+  if (!last_feasibility_.valid) return;
   for (const Candidate &candidate : selected) {
     out.work.push_back(candidate.work);
+  }
+  if (decode_mode) {
+    if (consecutive_decode_batches_ !=
+        std::numeric_limits<std::uint32_t>::max()) {
+      ++consecutive_decode_batches_;
+    }
+  } else {
+    consecutive_decode_batches_ = 0;
   }
 }
 

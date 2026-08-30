@@ -22,16 +22,15 @@ struct HeuristicAIMDConfig {
   std::chrono::nanoseconds ttft_target = std::chrono::seconds(2);
   std::chrono::nanoseconds tpot_target = std::chrono::milliseconds(200);
   std::uint32_t starvation_threshold = 8;
+  std::uint32_t max_consecutive_decode_batches = 2;
   std::uint32_t max_prefill_chunk = 512;
 };
 
-struct BatchEstimate {
-  long double compute_operations = 0.0L;
-  long double memory_bytes = 0.0L;
-  long double additional_kv_bytes = 0.0L;
-  long double compute_pressure = 0.0L;
-  long double bandwidth_pressure = 0.0L;
-  double pressure = 0.0;
+struct BatchFeasibility {
+  std::uint64_t total_tokens = 0;
+  std::uint64_t work_items = 0;
+  long double resident_kv_bytes = 0.0L;
+  long double required_memory_bytes = 0.0L;
   bool valid = true;
 };
 
@@ -60,8 +59,8 @@ public:
     return prefill_window_;
   }
   [[nodiscard]] double decode_window() const noexcept { return decode_window_; }
-  [[nodiscard]] const BatchEstimate &last_estimate() const noexcept {
-    return last_estimate_;
+  [[nodiscard]] const BatchFeasibility &last_feasibility() const noexcept {
+    return last_feasibility_;
   }
 
 protected:
@@ -78,10 +77,8 @@ private:
   };
 
   [[nodiscard]] std::vector<Candidate> candidates() const;
-  [[nodiscard]] BatchEstimate
-  estimate(const std::vector<Candidate> &selected) const;
-  [[nodiscard]] long double
-  additional_kv_bytes(const Candidate &candidate) const;
+  [[nodiscard]] BatchFeasibility
+  check_feasibility(const std::vector<Candidate> &selected) const;
   [[nodiscard]] double utility(const Candidate &candidate) const;
   void update_window(double sample, std::optional<double> &ewma,
                      double &window, bool success);
@@ -92,8 +89,9 @@ private:
   double prefill_window_ = 1.0;
   double decode_window_ = 1.0;
   std::optional<double> decode_time_per_item_ewma_;
-  BatchEstimate last_estimate_{};
+  BatchFeasibility last_feasibility_{};
   std::unordered_map<RequestId, std::uint32_t> bypasses_;
+  std::uint32_t consecutive_decode_batches_ = 0;
 };
 
 namespace quickserve_benchmark_policy {

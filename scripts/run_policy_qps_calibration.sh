@@ -22,10 +22,13 @@ policy_input="$1"
 policy_dir="$(cd "$(dirname "$policy_input")" && pwd -P)"
 policy_source="$policy_dir/$(basename "$policy_input")"
 case "$policy_source" in
-  *.cpp) policy_stem="${policy_source%.cpp}" ;;
-  *.cc)  policy_stem="${policy_source%.cc}" ;;
-  *.cxx) policy_stem="${policy_source%.cxx}" ;;
-  *) echo "error: policy source must end in .cpp, .cc, or .cxx" >&2; exit 2 ;;
+*.cpp) policy_stem="${policy_source%.cpp}" ;;
+*.cc) policy_stem="${policy_source%.cc}" ;;
+*.cxx) policy_stem="${policy_source%.cxx}" ;;
+*)
+  echo "error: policy source must end in .cpp, .cc, or .cxx" >&2
+  exit 2
+  ;;
 esac
 
 if [[ -f "${policy_stem}.hpp" ]]; then
@@ -45,8 +48,14 @@ output_dir="${2:-/private/tmp/quickserve-${safe_policy_name}-calibration}"
 trace="$repo_root/data/AzureLLMInferenceTrace_code_1week.qst"
 model="/Users/vijaygoyal/.cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF/snapshots/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf"
 
-[[ -f "$trace" ]] || { echo "error: trace does not exist: $trace" >&2; exit 2; }
-[[ -f "$model" ]] || { echo "error: model does not exist: $model" >&2; exit 2; }
+[[ -f "$trace" ]] || {
+  echo "error: trace does not exist: $trace" >&2
+  exit 2
+}
+[[ -f "$model" ]] || {
+  echo "error: model does not exist: $model" >&2
+  exit 2
+}
 [[ ! -e "$output_dir" ]] || {
   echo "error: output directory already exists: $output_dir" >&2
   exit 2
