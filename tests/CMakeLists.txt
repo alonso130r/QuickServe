@@ -30,6 +30,7 @@ configure_model_free_test(test_hardware_profile hardware_profile)
 
 add_executable(test_heuristic_aimd
     test_heuristic_aimd.cpp
+    ${CMAKE_SOURCE_DIR}/src/policies/batch_utilities.cpp
     ${CMAKE_SOURCE_DIR}/src/policies/heuristic_aimd.cpp
     ${CMAKE_SOURCE_DIR}/src/runtime/scheduler.cpp
     ${CMAKE_SOURCE_DIR}/src/runtime/model_profile.cpp
@@ -80,6 +81,20 @@ add_executable(test_continuous_batched_fifo
     ${CMAKE_SOURCE_DIR}/src/runtime/scheduler.cpp
 )
 configure_model_free_test(test_continuous_batched_fifo continuous_batched_fifo)
+
+if(QUICKSERVE_BUILD_PROXQP_POLICY)
+    add_executable(test_proxqp_solver test_proxqp_solver.cpp)
+    target_link_libraries(test_proxqp_solver PRIVATE quickserve_proxqp_solver)
+    configure_model_free_test(test_proxqp_solver proxqp_solver)
+
+    add_executable(test_proxqp_scheduler
+        test_proxqp_scheduler.cpp
+        ${CMAKE_SOURCE_DIR}/src/policies/proxqp_scheduler.cpp
+        ${CMAKE_SOURCE_DIR}/src/policies/batch_utilities.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/scheduler.cpp)
+    target_link_libraries(test_proxqp_scheduler PRIVATE quickserve_proxqp_solver)
+    configure_model_free_test(test_proxqp_scheduler proxqp_scheduler)
+endif()
 
 if(QUICKSERVE_TEST_MODEL)
     get_filename_component(QUICKSERVE_TEST_MODEL_ABSOLUTE

@@ -1,6 +1,8 @@
 import importlib.util
 import pathlib
+import sys
 import unittest
+from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "find_max_qps.py"
@@ -14,6 +16,12 @@ def load_script():
 
 
 class SearchTests(unittest.TestCase):
+    def test_default_sequence_capacity_is_sixteen(self):
+        module = load_script()
+        with mock.patch.object(sys, "argv", ["find_max_qps.py", "--model", "model.gguf"]):
+            args = module.parse_args()
+        self.assertEqual(args.max_sequences, 16)
+
     def test_exponential_sweep_then_binary_search(self):
         module = load_script()
         probes = []

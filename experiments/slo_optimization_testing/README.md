@@ -33,7 +33,7 @@ Use 729 instances and at least 1,000 repetitions for the full run.
   --environment-id "machine|OS|backend-driver|power-mode"
 ```
 
-The collector randomizes composition order, reuses existing observations, and appends only missing cells or repetitions. The cache key includes source revisions, build type, model fingerprint, environment identity, backend settings, context, and batch composition.
+The collector randomizes composition order, reuses existing observations, and appends only missing cells or repetitions. The cache key includes a fingerprint of the backend measurement implementation, the llama.cpp revision, build type, model fingerprint, environment identity, backend settings, context, and batch composition. Unrelated QuickServe commits do not invalidate backend measurements.
 
 ## Offline evaluation
 
@@ -55,6 +55,17 @@ To collect missing measurements with the model configured for the main test suit
 ```sh
 experiments/slo_optimization_testing/run_offline_experiment.sh
 ```
+
+To collect or reuse the same measurements and export a fixed profile consumed
+by `ProxQPScheduler`:
+
+```sh
+scripts/calibrate_proxqp_policy.sh /tmp/proxqp-policy.conf
+```
+
+The exporter fits nonnegative runtime coefficients, calibrates the one-sided
+p98 residual margin, and writes the file atomically. It rejects caches that mix
+model, backend, build, hardware, or environment cohorts.
 
 The script builds the experiment when its binary is missing or stale, reads `QUICKSERVE_TEST_MODEL` from `build/CMakeCache.txt`, fills any missing cells in the 32-cell measurement grid, and writes `offline_results.csv` in this directory. Override locations with `QUICKSERVE_BUILD_DIR`, `SLO_BUILD_DIR`, `SLO_CACHE`, or `SLO_OUTPUT`.
 

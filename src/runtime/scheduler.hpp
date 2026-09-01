@@ -86,6 +86,20 @@ struct BatchOutcome {
   bool success = true;
 };
 
+enum class PolicyTimingEventKind : std::uint8_t {
+  FirstToken,
+  LaterToken,
+  Terminal,
+};
+
+struct PolicyTimingEvent {
+  RequestId id{};
+  PolicyTimingEventKind kind{PolicyTimingEventKind::FirstToken};
+  RequestState::TimePoint timestamp{};
+  RequestState::Clock::duration latency{};
+  ErrorCode error{ErrorCode::None};
+};
+
 // Threading contract:
 // - submit() is called before the scheduler worker starts or by that same
 //   scheduler-owning thread during replay. It is never a concurrent operation.
@@ -129,6 +143,7 @@ public:
 protected:
   virtual void build_plan(Plan &out) = 0;
   virtual void on_plan_completed(const BatchOutcome &) {}
+  virtual void on_request_timing(const PolicyTimingEvent &) {}
   [[nodiscard]] RequestState::TimePoint policy_now() const {
     return current_time_;
   }

@@ -205,7 +205,7 @@ void collect(const std::map<std::string, std::string> &a) {
     for (std::size_t order = 0; order < specs.size(); ++order) {
       const auto [p, d, ctx] = specs[order];
       const std::string key =
-          "schema=3|input_schema=bos-repeat-v1|qs=" SLO_QS_REV
+          "schema=3|input_schema=bos-repeat-v1|collector=" SLO_COLLECTOR_ID
           "|llama=" SLO_LLAMA_REV "|build=" SLO_BUILD_TYPE "|model_fnv64=" +
           model_hash + "|platform=" + platform_identity() +
           "|environment=" + environment +
@@ -239,6 +239,181 @@ void collect(const std::map<std::string, std::string> &a) {
   }
   std::cout << "cached " << added << " new observations across " << specs.size()
             << " compositions\n";
+}
+
+std::string cohort_identity(const std::string &key) {
+  std::stringstream input(key);
+  std::string part, result;
+  while (std::getline(input, part, '|')) {
+    if (part.rfind("p=", 0) == 0 || part.rfind("d=", 0) == 0 ||
+        part.rfind("ctx=", 0) == 0 || part.rfind("seq=", 0) == 0 ||
+        part.rfind("kv=", 0) == 0)
+      continue;
+    if (!result.empty()) result += '|';
+    result += part;
+  }
+  return result;
+}
+
+Eigen::Vector3d nonnegative_fit(const Eigen::MatrixXd &x,
+                                const Eigen::VectorXd &y) {
+  Eigen::Vector3d best = Eigen::Vector3d::Zero();
+  double best_error = y.squaredNorm();
+  for (unsigned mask = 1; mask < 8; ++mask) {
+    std::vector<unsigned> columns;
+    for (unsigned column = 0; column < 3; ++column)
+      if (mask & (1U << column)) columns.push_back(column);
+    Eigen::MatrixXd active(x.rows(), columns.size());
+    for (std::size_t column = 0; column < columns.size(); ++column)
+      active.col(column) = x.col(columns[column]);
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(active);
+    if (qr.rank() != static_cast<Eigen::Index>(columns.size())) continue;
+    const Eigen::VectorXd fitted = qr.solve(y);
+    if (!fitted.allFinite() || (fitted.array() < 0).any()) continue;
+    Eigen::Vector3d candidate = Eigen::Vector3d::Zero();
+    for (std::size_t column = 0; column < columns.size(); ++column)
+      candidate(columns[column]) = fitted(column);
+    const double error = (y - x * candidate).squaredNorm();
+    if (error < best_error) {
+      best = candidate;
+      best_error = error;
+    }
+  }
+  return best;
+}
+
+void export_profile(const std::map<std::string, std::string> &a) {
+  const auto rows = sloexp::MeasurementCache(need(a, "cache")).load();
+  if (rows.empty()) throw std::runtime_error("profile export cache is empty");
+  std::set<std::string> cohorts;
+  for (const auto &row : rows) cohorts.insert(cohort_identity(row.key));
+  const std::string current_collector = "collector=" SLO_COLLECTOR_ID;
+  const std::string current_llama = "llama=" SLO_LLAMA_REV;
+  const std::string current_build = "build=" SLO_BUILD_TYPE;
+  std::vector<std::string> compatible;
+  for (const auto &cohort : cohorts)
+    if (cohort.find(current_collector) != std::string::npos &&
+        cohort.find(current_llama) != std::string::npos &&
+        cohort.find(current_build) != std::string::npos)
+      compatible.push_back(cohort);
+  if (compatible.empty() && cohorts.size() == 1)
+    compatible.push_back(*cohorts.begin());
+  if (compatible.size() != 1)
+    throw std::runtime_error(
+        "profile export requires exactly one current-build cache cohort; found " +
+        std::to_string(compatible.size()) + " among " +
+        std::to_string(cohorts.size()));
+  const auto &selected_cohort = compatible.front();
+  std::map<std::string, std::vector<const sloexp::Measurement *>> cells;
+  for (const auto &row : rows)
+    if (cohort_identity(row.key) == selected_cohort)
+      cells[row.key].push_back(&row);
+  std::map<unsigned, std::vector<const sloexp::Measurement *>> training, calibration;
+  for (auto &[key, observations] : cells) {
+    std::sort(observations.begin(), observations.end(), [](auto *left, auto *right) {
+      return std::tie(left->run_id, left->observation_id) <
+             std::tie(right->run_id, right->observation_id);
+    });
+    if (observations.size() < 10)
+      throw std::runtime_error("profile export needs at least 10 repetitions per cell");
+    for (std::size_t i = 0; i < observations.size(); ++i) {
+      if (i % 10 < 6) training[observations[i]->context_tokens].push_back(observations[i]);
+      else if (i % 10 < 8) calibration[observations[i]->context_tokens].push_back(observations[i]);
+    }
+  }
+  struct FittedTier { unsigned context{}; Eigen::Vector3d beta; double margin{}, scale{}; };
+  std::vector<FittedTier> fitted;
+  const double quantile = real(a, "upper-bound-quantile", 0.98);
+  if (!(quantile > 0 && quantile <= 1))
+    throw std::invalid_argument("upper-bound-quantile must be in (0,1]");
+  for (const auto &[context, observations] : training) {
+    if (observations.size() < 3 || calibration[context].empty())
+      throw std::runtime_error("insufficient profile observations for context tier");
+    Eigen::MatrixXd x(observations.size(), 3);
+    Eigen::VectorXd y(observations.size());
+    for (std::size_t i = 0; i < observations.size(); ++i) {
+      x.row(i) << 1.0, observations[i]->prefill_tokens, observations[i]->decode_items;
+      y(i) = observations[i]->duration_ns;
+    }
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(x);
+    if (qr.rank() != 3)
+      throw std::runtime_error("profile regression design is rank deficient");
+    const Eigen::Vector3d beta = nonnegative_fit(x, y);
+    if (!beta.allFinite() || beta(0) <= 0)
+      throw std::runtime_error("profile regression produced invalid coefficients");
+    const Eigen::VectorXd residual = y - x * beta;
+    const double scale = std::max(1.0, std::sqrt(residual.squaredNorm() / residual.size()));
+    std::vector<double> calibration_residuals;
+    for (auto *row : calibration.at(context))
+      calibration_residuals.push_back(
+          row->duration_ns - beta(0) - beta(1) * row->prefill_tokens -
+          beta(2) * row->decode_items);
+    fitted.push_back({context, beta,
+                      std::max(0.0, sloexp::nearest_rank(calibration_residuals, quantile)),
+                      scale});
+  }
+  if (fitted.empty()) throw std::runtime_error("profile contains no context tiers");
+  const auto context_capacity = number(a, "context-capacity", fitted.back().context);
+  if (context_capacity < fitted.back().context || context_capacity > UINT32_MAX)
+    throw std::invalid_argument("context-capacity does not cover measured tiers");
+  if (context_capacity > fitted.back().context && fitted.size() < 2)
+    throw std::runtime_error("cannot extrapolate context runtime from one tier");
+  double context_slope = 0;
+  if (fitted.size() > 1) {
+    const double mean_context = std::accumulate(
+        fitted.begin(), fitted.end(), 0.0,
+        [](double sum, const auto &tier) { return sum + tier.context; }) /
+        fitted.size();
+    const double mean_base = std::accumulate(
+        fitted.begin(), fitted.end(), 0.0,
+        [](double sum, const auto &tier) { return sum + tier.beta(0); }) /
+        fitted.size();
+    double covariance = 0, variance = 0;
+    for (const auto &tier : fitted) {
+      covariance += (tier.context - mean_context) * (tier.beta(0) - mean_base);
+      variance += std::pow(tier.context - mean_context, 2);
+    }
+    context_slope = std::max(0.0, covariance / variance);
+  }
+  const auto output_path = std::filesystem::path(need(a, "output"));
+  const auto temporary = std::filesystem::path(output_path.string() + ".tmp");
+  std::ofstream out(temporary, std::ios::trunc);
+  if (!out) throw std::runtime_error("cannot open profile temporary file");
+  out << std::setprecision(17)
+      << "schema_version=1\ncalibration_id=" << SLO_QS_REV << '-' << wall_ns()
+      << "\nttft_target_ns=" << number(a, "ttft-target-ns", 2'000'000'000ULL)
+      << "\ntpot_target_ns=" << number(a, "tpot-target-ns", 200'000'000ULL)
+      << "\nwindow_ns=" << number(a, "window-ns", 60'000'000'000ULL)
+      << "\nruntime_weight=" << real(a, "runtime-weight", 0.1)
+      << "\nrho_prefill=" << real(a, "rho-prefill", 0.2)
+      << "\nrho_decode=" << real(a, "rho-decode", 0.2)
+      << "\nboundary_buffer_z=" << real(a, "boundary-buffer-z", 1.0)
+      << "\nboundary_weight=" << real(a, "boundary-weight", 0.25)
+      << "\ntier_count=" << fitted.size() << '\n';
+  const auto token_capacity = number(a, "token-capacity", 512);
+  const auto sequence_capacity = number(a, "sequence-capacity", 4);
+  for (std::size_t i = 0; i < fitted.size(); ++i) {
+    const auto prefix = "tier." + std::to_string(i) + ".";
+    const unsigned minimum = i == 0 ? 0 : fitted[i - 1].context + 1;
+    const unsigned maximum = i + 1 == fitted.size()
+                                 ? static_cast<unsigned>(context_capacity)
+                                 : fitted[i].context;
+    out << prefix << "context_min=" << minimum << '\n'
+        << prefix << "context_max=" << maximum << '\n'
+        << prefix << "tau_base_ns="
+        << fitted[i].beta(0) + context_slope * (maximum - fitted[i].context)
+        << '\n'
+        << prefix << "tau_prefill_ns_per_token=" << fitted[i].beta(1) << '\n'
+        << prefix << "tau_decode_ns_per_item=" << fitted[i].beta(2) << '\n'
+        << prefix << "runtime_margin_ns=" << fitted[i].margin << '\n'
+        << prefix << "runtime_scale_ns=" << fitted[i].scale << '\n'
+        << prefix << "token_capacity=" << token_capacity << '\n'
+        << prefix << "sequence_capacity=" << sequence_capacity << '\n';
+  }
+  out.close();
+  if (!out) throw std::runtime_error("cannot write profile");
+  std::filesystem::rename(temporary, output_path);
+  std::cout << "ProxQP policy profile written to " << output_path << '\n';
 }
 
 void evaluate(const std::map<std::string, std::string> &a) {
@@ -800,7 +975,7 @@ int main(int argc, char **argv) {
   try {
     if (argc < 2)
       throw std::invalid_argument("usage: slo_optimization_experiment "
-                                  "<synthetic|collect|evaluate> [options]");
+                                  "<synthetic|collect|evaluate|export-profile> [options]");
     auto a = args(argc, argv);
     std::string mode = argv[1];
     if (mode == "synthetic")
@@ -809,6 +984,8 @@ int main(int argc, char **argv) {
       collect(a);
     else if (mode == "evaluate")
       evaluate(a);
+    else if (mode == "export-profile")
+      export_profile(a);
     else
       throw std::invalid_argument("unknown mode");
     return 0;

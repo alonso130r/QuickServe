@@ -1,4 +1,5 @@
 #include "policies/heuristic_aimd.hpp"
+#include "policies/batch_utilities.hpp"
 
 #include <cstdio>
 #include <chrono>
@@ -72,6 +73,21 @@ void test_scheduler_owns_an_immutable_profile_copy() {
   CHECK(scheduler.hardware_profile().model_identifier == "Mac15,7");
   CHECK(scheduler.hardware_profile().total_memory_bytes ==
         32ULL * 1024 * 1024 * 1024);
+}
+
+void test_shared_resource_accounting_matches_aimd_units() {
+  std::list<RequestState> requests;
+  RequestState request;
+  request.id = 7;
+  request.stage = RequestState::Stage::Prefill;
+  request.prefill_position = 10;
+  requests.push_back(request);
+  const std::vector<WorkItem> work{{7, 10, 14, WorkKind::Prefill}};
+  const auto usage = quickserve::policy::evaluate_batch_resources(
+      requests, work, 64, test_profile(), test_hardware_profile());
+  CHECK(usage.total_tokens == 4);
+  CHECK(usage.work_items == 1);
+  CHECK(usage.valid);
 }
 
 void test_empty_policy_does_not_publish_an_illegal_plan() {
@@ -391,6 +407,7 @@ void test_started_prefill_keeps_locality_until_completion() {
 } // namespace
 
 int main() {
+  test_shared_resource_accounting_matches_aimd_units();
   test_scheduler_owns_an_immutable_profile_copy();
   test_empty_policy_does_not_publish_an_illegal_plan();
   test_scheduler_emits_bounded_prefill_work();

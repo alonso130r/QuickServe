@@ -356,6 +356,8 @@ void Scheduler::drain_completions() {
 
     state.prefill_position =
         std::max(state.prefill_position, completion.prefill_position);
+    const bool had_first_token = state.first_token_recorded;
+    const RequestState::TimePoint previous_token_time = state.last_token_time;
     if (completion.decoded_tokens > state.decoded_count) {
       if (completion.generated_token) {
         const RequestState::TimePoint token_time = current_time_;
@@ -368,6 +370,16 @@ void Scheduler::drain_completions() {
         state.output_token_ids.push_back(completion.token);
       }
       state.decoded_count = completion.decoded_tokens;
+      if (completion.generated_token) {
+        on_request_timing(
+            {state.id,
+             had_first_token ? PolicyTimingEventKind::LaterToken
+                             : PolicyTimingEventKind::FirstToken,
+             current_time_,
+             had_first_token ? current_time_ - previous_token_time
+                             : current_time_ - state.arrival_time,
+             completion.error});
+      }
     }
 
     state.eog_observed = state.eog_observed || completion.eos;
@@ -400,6 +412,9 @@ void Scheduler::drain_release_acks() {
     state.admission = RequestState::AdmissionOwnership::NotSent;
     state.finish_time = finish_time;
     state.finish_recorded = true;
+    on_request_timing({state.id, PolicyTimingEventKind::Terminal, current_time_,
+                       current_time_ - state.arrival_time,
+                       state.terminal_error});
     if (workload_counts_.active == 0)
       throw std::logic_error("active workload counter underflow");
     --workload_counts_.active;

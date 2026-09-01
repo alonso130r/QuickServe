@@ -25,7 +25,7 @@ def main():
     )
     parser.add_argument("--context-size", type=int, default=16384)
     parser.add_argument("--batch-capacity", type=int, default=512)
-    parser.add_argument("--max-sequences", type=int, default=4)
+    parser.add_argument("--max-sequences", type=int, default=16)
     parser.add_argument("--token-budget", type=int, default=512)
     parser.add_argument(
         "--output-dir",

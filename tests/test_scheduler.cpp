@@ -66,6 +66,7 @@ public:
 
   std::vector<WorkItem> next_work;
   std::vector<BatchOutcome> outcomes;
+  std::vector<PolicyTimingEvent> timing_events;
   int builds = 0;
 
   [[nodiscard]] RequestState::Stage live_stage(RequestId id) const {
@@ -82,6 +83,10 @@ public:
   }
 
 protected:
+  void on_request_timing(const PolicyTimingEvent &event) override {
+    timing_events.push_back(event);
+  }
+
   void on_plan_completed(const BatchOutcome &outcome) override {
     outcomes.push_back(outcome);
   }
@@ -1413,10 +1418,16 @@ void test_injected_clock_records_each_generated_token_time() {
   CHECK(handoff.try_report_completion(Completion{
       id, 2, 1, 9, WorkKind::Prefill, ErrorCode::None, true, false}));
   scheduler.run_once();
+  CHECK(scheduler.timing_events.size() == 1);
+  CHECK(scheduler.timing_events[0].kind == PolicyTimingEventKind::FirstToken);
+  CHECK(scheduler.timing_events[0].latency == std::chrono::nanoseconds(10));
   now = RequestState::TimePoint(std::chrono::nanoseconds(35));
   CHECK(handoff.try_report_completion(Completion{
       id, 2, 2, 10, WorkKind::Decode, ErrorCode::None, true, false}));
   scheduler.run_once();
+  CHECK(scheduler.timing_events.size() == 2);
+  CHECK(scheduler.timing_events[1].kind == PolicyTimingEventKind::LaterToken);
+  CHECK(scheduler.timing_events[1].latency == std::chrono::nanoseconds(15));
   CHECK(scheduler.requests()[id].first_token_time ==
         RequestState::TimePoint(std::chrono::nanoseconds(20)));
   CHECK(scheduler.requests()[id].last_token_time ==

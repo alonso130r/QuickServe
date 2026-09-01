@@ -83,6 +83,7 @@ void test_standardized_slack_is_unit_invariant() {
 }
 
 void test_cache_deduplicates_observations() {
+  CHECK(std::string(SLO_COLLECTOR_ID).size() == 64);
   const auto path =
       std::filesystem::temp_directory_path() /
       ("slo-cache-" +
@@ -169,6 +170,54 @@ void test_evaluate_mode_emits_paired_decisions(
   std::filesystem::remove(cache_path);
   std::filesystem::remove(output_path);
 }
+
+void test_export_profile_emits_calibrated_context_tiers(
+    const std::filesystem::path &binary_dir) {
+  const auto stamp = std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto cache_path = std::filesystem::temp_directory_path() /
+                          ("slo-profile-cache-" + stamp + ".csv");
+  const auto output_path = std::filesystem::temp_directory_path() /
+                           ("slo-profile-" + stamp + ".conf");
+  sloexp::MeasurementCache cache(cache_path);
+  std::uint32_t position = 0;
+  for (unsigned context : {512U, 2048U})
+    for (const auto [p, d] : std::vector<std::pair<unsigned, unsigned>>{
+             {32, 1}, {64, 1}, {32, 4}, {64, 4}})
+      for (unsigned rep = 0; rep < 10; ++rep) {
+        const auto key = "schema=3|collector=" SLO_COLLECTOR_ID
+                         "|llama=" SLO_LLAMA_REV
+                         "|build=" SLO_BUILD_TYPE "|cohort=test|p=" + std::to_string(p) +
+                         "|d=" + std::to_string(d) + "|ctx=" +
+                         std::to_string(context) + "|seq=" +
+                         std::to_string(d + 1);
+        cache.append({key, "obs-" + std::to_string(context) + "-" +
+                               std::to_string(p) + "-" + std::to_string(d) +
+                               "-" + std::to_string(rep),
+                      "run", rep, p, d, context,
+                      1'000'000 + 2'000 * p + 5'000 * d + rep * 100,
+                      rep, position++, d + 1});
+      }
+  for (unsigned rep = 0; rep < 10; ++rep)
+    cache.append({"schema=3|collector=stale|cohort=test|p=32|d=1|ctx=512|seq=2",
+                  "stale-" + std::to_string(rep), "stale-run", rep, 32, 1,
+                  512, 1'000'000, rep, position++, 2});
+  const auto executable = binary_dir / "slo_optimization_experiment";
+  const std::string command =
+      "\"" + executable.string() + "\" export-profile --cache \"" +
+      cache_path.string() + "\" --output \"" + output_path.string() +
+      "\" --context-capacity 16384 --token-capacity 512 "
+      "--sequence-capacity 4";
+  CHECK(std::system(command.c_str()) == 0);
+  std::ifstream in(output_path);
+  std::string contents((std::istreambuf_iterator<char>(in)), {});
+  CHECK(contents.find("schema_version=1") != std::string::npos);
+  CHECK(contents.find("tier_count=2") != std::string::npos);
+  CHECK(contents.find("tier.0.tau_prefill_ns_per_token=") != std::string::npos);
+  CHECK(contents.find("tier.1.context_max=16384") != std::string::npos);
+  std::filesystem::remove(cache_path);
+  std::filesystem::remove(output_path);
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -182,6 +231,9 @@ int main(int argc, char **argv) {
   test_solvers_agree_on_shared_qp();
   if (argc > 0)
     test_evaluate_mode_emits_paired_decisions(
+        std::filesystem::path(argv[0]).parent_path());
+  if (argc > 0)
+    test_export_profile_emits_calibrated_context_tiers(
         std::filesystem::path(argv[0]).parent_path());
   if (failures)
     return 1;

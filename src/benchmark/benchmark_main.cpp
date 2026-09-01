@@ -50,6 +50,7 @@ struct Options {
   std::filesystem::path trace;
   std::filesystem::path model;
   std::filesystem::path output_dir;
+  std::filesystem::path policy_config;
   double target_qps{};
   qb::SelectionLimits limits;
   OutputMode output_mode = OutputMode::Natural;
@@ -57,7 +58,7 @@ struct Options {
   bool output_mode_supplied = false;
   std::uint32_t context_size = 4096;
   std::uint32_t batch_capacity = 512;
-  std::uint32_t max_sequences = 4;
+  std::uint32_t max_sequences = 16;
   std::uint32_t token_budget = 512;
 };
 
@@ -80,6 +81,7 @@ Options parse_options(int argc, char **argv) {
     if (key == "--trace") options.trace = value;
     else if (key == "--model") options.model = value;
     else if (key == "--output-dir") options.output_dir = value;
+    else if (key == "--policy-config") options.policy_config = value;
     else if (key == "--target-qps") {
       std::size_t used = 0;
       options.target_qps = std::stod(value, &used);
@@ -244,7 +246,7 @@ int run(const Options &options) {
       RequestState::TimePoint start{};
       scheduler = quickserve_benchmark_adapter::create(
           handoff, options.token_budget, *startup.model_profile,
-          *hardware_profile);
+          *hardware_profile, options.policy_config);
       if (!scheduler) throw std::runtime_error("policy factory returned null");
       scheduler->set_clock(clock);
       scheduler->set_workload_observer([&](RequestState::TimePoint at,

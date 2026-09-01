@@ -56,6 +56,10 @@ endif()
 
 add_subdirectory(external/llama.cpp)
 find_package(Threads REQUIRED)
+option(QUICKSERVE_BUILD_PROXQP_POLICY "Build the ProxQP scheduler policy" OFF)
+if(QUICKSERVE_BUILD_PROXQP_POLICY)
+    find_package(proxsuite CONFIG REQUIRED)
+endif()
 
 add_library(quickserve_runtime
     src/runtime/scheduler.cpp
@@ -74,12 +78,23 @@ target_include_directories(quickserve_runtime PUBLIC
 )
 target_compile_features(quickserve_runtime PUBLIC cxx_std_17)
 
-add_library(quickserve_policies src/policies/fifo.cpp)
+add_library(quickserve_policies
+    src/policies/fifo.cpp
+    src/policies/batch_utilities.cpp)
 target_link_libraries(quickserve_policies PUBLIC quickserve_runtime)
 target_include_directories(quickserve_policies PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_features(quickserve_policies PUBLIC cxx_std_17)
+
+if(QUICKSERVE_BUILD_PROXQP_POLICY)
+    add_library(quickserve_proxqp_solver src/optimization/proxqp_solver.cpp)
+    target_include_directories(quickserve_proxqp_solver PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quickserve_proxqp_solver PUBLIC proxsuite::proxsuite)
+    target_compile_features(quickserve_proxqp_solver PUBLIC cxx_std_17)
+    target_link_libraries(quickserve_policies PUBLIC quickserve_proxqp_solver)
+endif()
 
 add_library(quickserve_trace src/benchmark/trace.cpp)
 target_include_directories(quickserve_trace PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)

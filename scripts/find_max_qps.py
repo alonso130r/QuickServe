@@ -70,7 +70,7 @@ def parse_args():
                         default="trace-exact")
     parser.add_argument("--context-size", type=int, default=16384)
     parser.add_argument("--batch-capacity", type=int, default=512)
-    parser.add_argument("--max-sequences", type=int, default=4)
+    parser.add_argument("--max-sequences", type=int, default=16)
     parser.add_argument("--token-budget", type=int, default=512)
     parser.add_argument("--work-dir", type=pathlib.Path,
                         help="Keep each probe's full benchmark results here")

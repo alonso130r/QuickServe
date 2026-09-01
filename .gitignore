@@ -1,5 +1,6 @@
 build/
 build-slo/
+build-slo-proxqp/
 
 .clangd
 

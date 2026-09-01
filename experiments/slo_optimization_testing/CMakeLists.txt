@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.18)
 project(quickserve_slo_optimization_experiment LANGUAGES CXX)
 execute_process(COMMAND git rev-parse --short=12 HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/../.. OUTPUT_VARIABLE QS_REV OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND git rev-parse --short=12 HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/../../external/llama.cpp OUTPUT_VARIABLE LLAMA_REV OUTPUT_STRIP_TRAILING_WHITESPACE)
+file(SHA256 "${CMAKE_CURRENT_LIST_DIR}/backend_cache.cpp" COLLECTOR_CPP_SHA)
+file(SHA256 "${CMAKE_CURRENT_LIST_DIR}/backend_cache.hpp" COLLECTOR_HPP_SHA)
+string(SHA256 COLLECTOR_ID
+       "schema=3|backend_cache.cpp=${COLLECTOR_CPP_SHA}|backend_cache.hpp=${COLLECTOR_HPP_SHA}")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,6 +37,7 @@ target_link_libraries(slo_experiment_core PUBLIC
     llama)
 target_compile_definitions(slo_experiment_core PUBLIC
     SLO_QS_REV="${QS_REV}" SLO_LLAMA_REV="${LLAMA_REV}"
+    SLO_COLLECTOR_ID="${COLLECTOR_ID}"
     SLO_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
 
 add_executable(slo_optimization_experiment main.cpp)

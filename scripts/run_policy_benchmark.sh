@@ -47,7 +47,7 @@ build_dir="/private/tmp/quickserve-benchmark-${safe_policy_name}"
 requested_output_dir="${2:-}"
 
 trace="$repo_root/data/AzureLLMInferenceTrace_code_1week.qst"
-model="/Users/vijaygoyal/.cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF/snapshots/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf"
+model=${QUICKSERVE_TEST_MODEL:-"/Users/vijaygoyal/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B-GGUF/snapshots/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf"}
 
 [[ -f "$trace" ]] || {
   echo "error: trace does not exist: $trace" >&2
@@ -58,11 +58,32 @@ model="/Users/vijaygoyal/.cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF
   exit 2
 }
 
+cmake_options=()
+policy_options=()
+if [[ "$(basename "$policy_source")" == "proxqp_scheduler.cpp" ]]; then
+  policy_config=${QUICKSERVE_POLICY_CONFIG:-"$build_dir/proxqp_policy.conf"}
+  if [[ -z "${QUICKSERVE_POLICY_CONFIG:-}" && ! -f "$policy_config" ]]; then
+    "$repo_root/scripts/calibrate_proxqp_policy.sh" "$policy_config"
+  fi
+  [[ -f "$policy_config" ]] || {
+    echo "error: ProxQP policy profile does not exist: $policy_config" >&2
+    exit 2
+  }
+  cmake_options+=(
+    -DQUICKSERVE_BUILD_PROXQP_POLICY=ON
+    "-DCMAKE_PREFIX_PATH=${PROXSUITE_PREFIX:-$(brew --prefix proxsuite)}"
+  )
+  policy_options+=(--policy-config "$policy_config")
+fi
+
 echo "Configuring policy: $policy_source"
+env CC="${QUICKSERVE_CC:-/usr/bin/clang}" \
+  CXX="${QUICKSERVE_CXX:-/usr/bin/clang++}" \
 cmake -S "$repo_root" -B "$build_dir" \
   -DCMAKE_BUILD_TYPE=Release \
   -DQUICKSERVE_BENCHMARK_POLICY_SOURCE="$policy_source" \
-  -DQUICKSERVE_BENCHMARK_POLICY_HEADER="$policy_header"
+  -DQUICKSERVE_BENCHMARK_POLICY_HEADER="$policy_header" \
+  "${cmake_options[@]}"
 
 echo "Building quickserve_benchmark..."
 cmake --build "$build_dir" --target quickserve_benchmark -j "$(sysctl -n hw.logicalcpu)"
@@ -81,8 +102,9 @@ caffeinate -i "$build_dir/quickserve_benchmark" \
   --output-dir "$prelim_output" \
   --context-size 16384 \
   --batch-capacity 512 \
-  --max-sequences 4 \
-  --token-budget 512
+  --max-sequences 16 \
+  --token-budget 512 \
+  "${policy_options[@]}"
 
 read -r measured_qps target_qps <<< "$(python3 -c '
 import json, sys
@@ -119,5 +141,6 @@ exec caffeinate -i "$build_dir/quickserve_benchmark" \
   --output-dir "$output_dir" \
   --context-size 16384 \
   --batch-capacity 512 \
-  --max-sequences 4 \
-  --token-budget 512
+  --max-sequences 16 \
+  --token-budget 512 \
+  "${policy_options[@]}"

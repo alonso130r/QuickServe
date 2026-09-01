@@ -1,4 +1,5 @@
 #include "heuristic_aimd.hpp"
+#include "batch_utilities.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -163,46 +164,14 @@ double HeuristicAIMD::utility(const Candidate &candidate) const {
 
 BatchFeasibility HeuristicAIMD::check_feasibility(
     const std::vector<Candidate> &selected) const {
-  BatchFeasibility result{};
-  const long double kv_dimension =
-      static_cast<long double>(model_profile_.kv_head_count) *
-      model_profile_.head_dimension;
-  const long double kv_scalar_bytes =
-      model_profile_.key_effective_bytes_per_scalar +
-      model_profile_.value_effective_bytes_per_scalar;
-  const long double kv_bytes_per_token =
-      static_cast<long double>(model_profile_.layer_count) * kv_dimension *
-      kv_scalar_bytes;
-
-  std::uint64_t resident_tokens = 0;
-  for (const RequestState &request : policy_requests()) {
-    if (request.stage != RequestState::Stage::Prefill &&
-        request.stage != RequestState::Stage::Decode) {
-      continue;
-    }
-    resident_tokens += request.prefill_position;
-    if (request.decoded_count > 0) resident_tokens += request.decoded_count - 1;
-  }
-  for (const Candidate &candidate : selected) {
-    result.total_tokens += candidate.work.token_count();
-    resident_tokens += candidate.work.kind == WorkKind::Prefill
-                           ? candidate.work.token_count()
-                           : 1;
-  }
-  result.work_items = selected.size();
-  result.resident_kv_bytes = kv_bytes_per_token * resident_tokens;
-  result.required_memory_bytes =
-      static_cast<long double>(model_profile_.model_bytes) +
-      result.resident_kv_bytes;
-  result.valid =
-      result.total_tokens <= token_budget_ &&
-      result.total_tokens <= model_profile_.batch_capacity &&
-      result.work_items <= model_profile_.max_sequences &&
-      std::isfinite(result.resident_kv_bytes) &&
-      std::isfinite(result.required_memory_bytes) &&
-      result.required_memory_bytes <=
-          static_cast<long double>(hardware_profile_.total_memory_bytes);
-  return result;
+  std::vector<WorkItem> work;
+  work.reserve(selected.size());
+  for (const Candidate &candidate : selected)
+    work.push_back(candidate.work);
+  const auto usage = quickserve::policy::evaluate_batch_resources(
+      policy_requests(), work, token_budget_, model_profile_, hardware_profile_);
+  return {usage.total_tokens, usage.work_items, usage.resident_kv_bytes,
+          usage.required_memory_bytes, usage.valid};
 }
 
 void HeuristicAIMD::build_plan(Plan &out) {

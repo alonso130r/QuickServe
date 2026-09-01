@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Download a single Qwen3.5-2B GGUF quantization to the Hugging Face cache."""
+"""Download a single Qwen3.5-0.8B GGUF quantization to the Hugging Face cache."""
 
 import argparse
 import pathlib
 import sys
 
 
-REPO_ID = "unsloth/Qwen3.5-2B-GGUF"
+REPO_ID = "unsloth/Qwen3.5-0.8B-GGUF"
 DEFAULT_QUANT = "Q4_K_M"
 
 
 def select_model_file(files, quant):
-    expected = f"Qwen3.5-2B-{quant}.gguf"
+    expected = f"Qwen3.5-0.8B-{quant}.gguf"
     matches = [name for name in files if pathlib.PurePosixPath(name).name == expected]
     if not matches:
         raise ValueError(f"No file named {expected!r} was found in {REPO_ID}")
@@ -23,7 +23,7 @@ def select_model_file(files, quant):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Cache one Qwen3.5-2B GGUF quantization and print its path."
+        description="Cache one Qwen3.5-0.8B GGUF quantization and print its path."
     )
     parser.add_argument("--quant", default=DEFAULT_QUANT)
     return parser.parse_args(argv)

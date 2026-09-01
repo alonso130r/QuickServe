@@ -12,6 +12,7 @@ benchmark for comparing scheduling behavior on Apple Silicon.
 - A C++17 compiler
 - Git submodules
 - Optional: Homebrew `libomp` for OpenMP support
+- ProxSuite when building the optional ProxQP scheduler policy
 
 ## Build and test
 
@@ -22,6 +23,36 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+Enable the separate ProxQP policy and its focused tests with:
+
+```sh
+cmake -S . -B build -DQUICKSERVE_BUILD_PROXQP_POLICY=ON \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix proxsuite)"
+cmake --build build
+```
+
+`ProxQPScheduler` requires a calibrated fixed profile and emits decision and
+completed-batch measurements through callbacks. It does not update the profile
+online. Generate the profile, then run the QPS calibration with:
+
+```sh
+scripts/calibrate_proxqp_policy.sh /tmp/proxqp-policy.conf
+QUICKSERVE_POLICY_CONFIG=/tmp/proxqp-policy.conf \
+  scripts/run_policy_qps_calibration.sh src/policies/proxqp_scheduler.cpp
+```
+
+Run the full 10,000-request benchmark with the same profile:
+
+```sh
+QUICKSERVE_POLICY_CONFIG=/tmp/proxqp-policy.conf \
+  scripts/run_policy_benchmark.sh src/policies/proxqp_scheduler.cpp
+```
+
+If `QUICKSERVE_POLICY_CONFIG` is omitted, either benchmark script calibrates a
+profile once under its temporary policy build directory and reuses it. Override
+the calibration model with `QUICKSERVE_TEST_MODEL`; the grid and fit controls
+use the `SLO_*` variables documented by the optimization experiment.
 
 To include the real-backend test, configure with a local GGUF model:
 

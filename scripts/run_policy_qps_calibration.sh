@@ -46,7 +46,7 @@ safe_policy_name="$(printf '%s' "$policy_name" | tr -c 'A-Za-z0-9._-' '-')"
 build_dir="/private/tmp/quickserve-benchmark-${safe_policy_name}"
 output_dir="${2:-/private/tmp/quickserve-${safe_policy_name}-calibration}"
 trace="$repo_root/data/AzureLLMInferenceTrace_code_1week.qst"
-model="/Users/vijaygoyal/.cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF/snapshots/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf"
+model=${QUICKSERVE_TEST_MODEL:-"/Users/vijaygoyal/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B-GGUF/snapshots/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf"}
 
 [[ -f "$trace" ]] || {
   echo "error: trace does not exist: $trace" >&2
@@ -61,10 +61,31 @@ model="/Users/vijaygoyal/.cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF
   exit 2
 }
 
-cmake -S "$repo_root" -B "$build_dir" \
+cmake_options=()
+policy_options=()
+if [[ "$(basename "$policy_source")" == "proxqp_scheduler.cpp" ]]; then
+  policy_config=${QUICKSERVE_POLICY_CONFIG:-"$build_dir/proxqp_policy.conf"}
+  if [[ -z "${QUICKSERVE_POLICY_CONFIG:-}" && ! -f "$policy_config" ]]; then
+    "$repo_root/scripts/calibrate_proxqp_policy.sh" "$policy_config"
+  fi
+  [[ -f "$policy_config" ]] || {
+    echo "error: ProxQP policy profile does not exist: $policy_config" >&2
+    exit 2
+  }
+  cmake_options+=(
+    -DQUICKSERVE_BUILD_PROXQP_POLICY=ON
+    "-DCMAKE_PREFIX_PATH=${PROXSUITE_PREFIX:-$(brew --prefix proxsuite)}"
+  )
+  policy_options+=(--policy-config "$policy_config")
+fi
+
+env CC="${QUICKSERVE_CC:-/usr/bin/clang}" \
+  CXX="${QUICKSERVE_CXX:-/usr/bin/clang++}" \
+  cmake -S "$repo_root" -B "$build_dir" \
   -DCMAKE_BUILD_TYPE=Release \
   -DQUICKSERVE_BENCHMARK_POLICY_SOURCE="$policy_source" \
-  -DQUICKSERVE_BENCHMARK_POLICY_HEADER="$policy_header"
+  -DQUICKSERVE_BENCHMARK_POLICY_HEADER="$policy_header" \
+  ${cmake_options[@]+"${cmake_options[@]}"}
 
 cmake --build "$build_dir" --target quickserve_benchmark \
   -j "$(sysctl -n hw.logicalcpu)"
@@ -72,13 +93,14 @@ cmake --build "$build_dir" --target quickserve_benchmark \
 caffeinate -i "$build_dir/quickserve_benchmark" \
   --trace "$trace" \
   --model "$model" \
-  --target-qps 1000 \
+  --target-qps 1.1 \
   --max-requests 128 \
   --output-mode trace-exact \
   --output-dir "$output_dir" \
   --context-size 16384 \
   --batch-capacity 512 \
-  --max-sequences 4 \
-  --token-budget 512
+  --max-sequences 16 \
+  --token-budget 512 \
+  ${policy_options[@]+"${policy_options[@]}"}
 
 echo "Calibration result: $output_dir/summary.json"
