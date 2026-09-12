@@ -1,6 +1,7 @@
 #include "scheduler.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -11,7 +12,8 @@ Scheduler::Scheduler(Handoff &handoff, std::uint32_t token_budget,
                      ClockFunction clock)
     : token_budget_(token_budget), handoff_(handoff),
       clock_(clock ? std::move(clock)
-                   : [] { return RequestState::Clock::now(); }) {
+                   : [] { return RequestState::Clock::now(); }),
+      decision_clock_([] { return RequestState::Clock::now(); }) {
   if (token_budget == 0) {
     throw std::invalid_argument("Scheduler token budget must be positive");
   }
@@ -101,6 +103,13 @@ void Scheduler::set_clock(ClockFunction clock) {
   clock_ = std::move(clock);
 }
 
+void Scheduler::set_decision_clock(ClockFunction clock) {
+  if (execution_started_)
+    throw std::logic_error("decision clock must be set before execution");
+  if (!clock) throw std::invalid_argument("decision clock must be callable");
+  decision_clock_ = std::move(clock);
+}
+
 bool Scheduler::run_once() {
   begin_nonconst_operation();
   if (!execution_started_) {
@@ -169,7 +178,16 @@ bool Scheduler::run_once() {
       });
 
   Plan &plan = handoff_.begin();
+  const RequestState::TimePoint decision_start = decision_clock_();
   build_plan(plan);
+  const RequestState::TimePoint decision_end = decision_clock_();
+  if (decision_end < decision_start) {
+    throw std::runtime_error("scheduler decision clock moved backwards");
+  }
+  decision_times_ns_.push_back(static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          decision_end - decision_start)
+          .count()));
   if (!plan.work.empty()) {
     SchedulerError validation = validate_plan(plan);
     if (!validation.valid) {
@@ -258,6 +276,28 @@ const SchedulerError &Scheduler::last_error() const { return last_error_; }
 
 SchedulerWorkloadCounts Scheduler::workload_counts() const {
   return workload_counts_;
+}
+
+SchedulerDecisionTiming Scheduler::decision_timing() const {
+  SchedulerDecisionTiming result;
+  result.decision_count = decision_times_ns_.size();
+  if (decision_times_ns_.empty()) return result;
+
+  long double sum = 0;
+  for (const std::uint64_t duration : decision_times_ns_) sum += duration;
+  result.mean_decision_time_ns =
+      static_cast<double>(sum / decision_times_ns_.size());
+
+  std::vector<std::uint64_t> sorted = decision_times_ns_;
+  std::sort(sorted.begin(), sorted.end());
+  const auto percentile = [&](double q) {
+    const std::size_t rank = static_cast<std::size_t>(
+        std::ceil(q * static_cast<double>(sorted.size())));
+    return sorted[std::max<std::size_t>(1, rank) - 1];
+  };
+  result.p95_decision_time_ns = percentile(.95);
+  result.p99_decision_time_ns = percentile(.99);
+  return result;
 }
 
 bool Scheduler::finish_iteration(bool keep_running) {

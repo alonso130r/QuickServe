@@ -7,6 +7,8 @@
 #include <optional>
 #include <string>
 
+#include "runtime/scheduler.hpp"
+
 namespace quickserve::benchmark {
 
 struct RunMetadata {
@@ -76,6 +78,7 @@ struct LogSketch {
 };
 
 [[nodiscard]] long double log_sketch_relative_error();
+[[nodiscard]] std::uint64_t peak_resident_memory_bytes();
 
 class AtomicResults {
 public:
@@ -88,6 +91,8 @@ public:
                      std::uint64_t duration_ns, bool success) noexcept;
   void sample_counts(std::uint64_t now_ns, std::uint64_t active,
                      std::uint64_t queued);
+  void set_scheduler_decision_timing(const SchedulerDecisionTiming &timing);
+  void set_peak_resident_memory_bytes(std::uint64_t bytes);
   void finish(std::uint64_t wall_duration_ns);
 
 private:
@@ -144,6 +149,8 @@ private:
   long double pure_prefill_duration_sum_{};
   long double pure_decode_duration_sum_{};
   long double mixed_duration_sum_{};
+  SchedulerDecisionTiming scheduler_decision_timing_;
+  std::optional<std::uint64_t> peak_resident_memory_bytes_;
   bool begun_{};
   bool finished_{};
 };

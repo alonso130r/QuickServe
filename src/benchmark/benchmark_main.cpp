@@ -234,8 +234,8 @@ int run(const Options &options) {
 
   std::exception_ptr replay_error;
   std::uint64_t replay_wall_duration_ns = 0;
+  std::unique_ptr<Scheduler> scheduler;
   replay_thread = std::thread([&] {
-    std::unique_ptr<Scheduler> scheduler;
     try {
       const Scheduler::ClockFunction clock = [] { return RequestState::Clock::now(); };
       std::unordered_map<RequestId, ActiveMetadata> active_metadata;
@@ -369,6 +369,11 @@ int run(const Options &options) {
   });
   workers.join_all();
   if (replay_error) std::rethrow_exception(replay_error);
+  const std::uint64_t peak_rss_bytes = qb::peak_resident_memory_bytes();
+  const SchedulerDecisionTiming scheduler_decision_timing =
+      scheduler->decision_timing();
+  results.set_scheduler_decision_timing(scheduler_decision_timing);
+  results.set_peak_resident_memory_bytes(peak_rss_bytes);
   results.finish(replay_wall_duration_ns);
   std::cout << "Benchmark complete. Results: "
             << std::filesystem::absolute(options.output_dir).string() << '\n';

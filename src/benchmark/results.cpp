@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <sys/resource.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <fcntl.h>
@@ -98,7 +99,24 @@ void publish_directory_exclusive(const std::filesystem::path &source,
 #endif
 }
 
+std::uint64_t read_peak_resident_memory_bytes() {
+  rusage usage{};
+  if (::getrusage(RUSAGE_SELF, &usage) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "cannot read peak resident memory");
+  }
+#if defined(__linux__)
+  return static_cast<std::uint64_t>(usage.ru_maxrss) * 1024;
+#else
+  return static_cast<std::uint64_t>(usage.ru_maxrss);
+#endif
+}
+
 } // namespace
+
+std::uint64_t peak_resident_memory_bytes() {
+  return read_peak_resident_memory_bytes();
+}
 
 void LogSketch::add(std::uint64_t value) {
   const auto bin = bin_for(value);
@@ -250,6 +268,17 @@ void AtomicResults::sample_counts(std::uint64_t now_ns, std::uint64_t active,
   peak_queued_ = std::max(peak_queued_, queued);
 }
 
+void AtomicResults::set_scheduler_decision_timing(
+    const SchedulerDecisionTiming &timing) {
+  if (!begun_ || finished_) throw std::logic_error("results are not open");
+  scheduler_decision_timing_ = timing;
+}
+
+void AtomicResults::set_peak_resident_memory_bytes(std::uint64_t bytes) {
+  if (!begun_ || finished_) throw std::logic_error("results are not open");
+  peak_resident_memory_bytes_ = bytes;
+}
+
 void AtomicResults::finish(std::uint64_t wall_duration_ns) {
   if (!begun_ || finished_) throw std::logic_error("results are not open");
   sample_counts(wall_duration_ns, last_active_, last_queued_);
@@ -278,6 +307,9 @@ void AtomicResults::finish(std::uint64_t wall_duration_ns) {
   };
   const long double fairness = fairness_count_ == 0 || fairness_square_sum_ == 0 ? 0 :
       fairness_sum_ * fairness_sum_ / (fairness_count_ * fairness_square_sum_);
+  const std::uint64_t peak_rss_bytes = peak_resident_memory_bytes_
+      ? *peak_resident_memory_bytes_
+      : peak_resident_memory_bytes();
   summary << '{'
     << "\"policy_identity\":{"
     << "\"name\":" << json_string(metadata_.policy_name) << ','
@@ -311,6 +343,7 @@ void AtomicResults::finish(std::uint64_t wall_duration_ns) {
     << "\"admission_rejections\":" << admission_rejections_ << ','
     << "\"eog_shortened\":" << eog_shortened_ << "},"
     << "\"wall_duration_ns\":" << wall_duration_ns << ','
+    << "\"peak_resident_memory_bytes\":" << peak_rss_bytes << ','
     << "\"executed_input_tokens\":" << input_tokens_ << ','
     << "\"generated_output_tokens\":" << output_tokens_ << ','
     << "\"offered_request_qps\":" << (metadata_.offered_request_qps ? std::to_string(*metadata_.offered_request_qps) : "null") << ','
@@ -323,7 +356,24 @@ void AtomicResults::finish(std::uint64_t wall_duration_ns) {
     << "\"mean_active_requests\":" << nullable(active_integral_ / std::max<std::uint64_t>(1, wall_duration_ns), wall_duration_ns != 0) << ','
     << "\"mean_queued_requests\":" << nullable(queued_integral_ / std::max<std::uint64_t>(1, wall_duration_ns), wall_duration_ns != 0) << ','
     << "\"peak_active_requests\":" << peak_active_ << ',' << "\"peak_queued_requests\":" << peak_queued_ << ','
+    << "\"final_active_requests\":" << last_active_ << ','
+    << "\"final_queued_requests\":" << last_queued_ << ','
     << "\"jain_fairness\":" << nullable(fairness, fairness_count_ != 0 && fairness_square_sum_ != 0) << ',';
+  summary << "\"scheduler\":{"
+    << "\"decision_count\":" << scheduler_decision_timing_.decision_count << ','
+    << "\"mean_decision_time_ns\":"
+    << (scheduler_decision_timing_.mean_decision_time_ns
+            ? nullable(*scheduler_decision_timing_.mean_decision_time_ns, true)
+            : "null")
+    << ",\"p95_decision_time_ns\":"
+    << (scheduler_decision_timing_.p95_decision_time_ns
+            ? std::to_string(*scheduler_decision_timing_.p95_decision_time_ns)
+            : "null")
+    << ",\"p99_decision_time_ns\":"
+    << (scheduler_decision_timing_.p99_decision_time_ns
+            ? std::to_string(*scheduler_decision_timing_.p99_decision_time_ns)
+            : "null")
+    << "},";
   summary << "\"batches\":{"
     << "\"total\":" << batch_count_ << ','
     << "\"pure_prefill\":" << pure_prefill_batches_ << ','

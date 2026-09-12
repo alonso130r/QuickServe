@@ -4,6 +4,7 @@
 import argparse
 import json
 import math
+import numbers
 import pathlib
 import subprocess
 import sys
@@ -14,15 +15,66 @@ from typing import Callable, NamedTuple
 class ProbeResult(NamedTuple):
     qps: float
     achieved_qps: float
+    ttft_p99_ns: int
+    tpot_p99_ns: int
     peak_queued: int
+    final_active: int
+    final_queued: int
+    failed: int
+    rejected: int
     sustainable: bool
 
 
-def is_sustainable(target_qps, achieved_qps, peak_queued, requests,
-                   throughput_ratio, queue_fraction):
+def is_sustainable(target_qps, achieved_qps, ttft_p99_ns, tpot_p99_ns,
+                   peak_queued, final_active, final_queued, failed, rejected,
+                   requests, throughput_ratio, queue_fraction,
+                   max_p99_ttft_ns, max_p99_tpot_ns):
     queue_limit = max(8, math.floor(requests * queue_fraction))
     return (achieved_qps >= target_qps * throughput_ratio
-            and peak_queued <= queue_limit)
+            and ttft_p99_ns <= max_p99_ttft_ns
+            and tpot_p99_ns <= max_p99_tpot_ns
+            and peak_queued <= queue_limit
+            and final_active == 0
+            and final_queued == 0
+            and failed == 0
+            and rejected == 0)
+
+
+def probe_result_from_summary(target_qps, summary, args):
+    def nonnegative_number(value):
+        if (isinstance(value, bool) or not isinstance(value, numbers.Real)
+                or not math.isfinite(value) or value < 0):
+            raise ValueError
+        return value
+
+    def nonnegative_count(value):
+        number = nonnegative_number(value)
+        if not float(number).is_integer():
+            raise ValueError
+        return int(number)
+
+    try:
+        achieved_qps = nonnegative_number(summary["achieved_request_qps"])
+        ttft_p99_ns = nonnegative_count(summary["ttft"]["p99_ns"])
+        tpot_p99_ns = nonnegative_count(summary["tpot"]["p99_ns"])
+        peak_queued = nonnegative_count(summary["peak_queued_requests"])
+        final_active = nonnegative_count(summary["final_active_requests"])
+        final_queued = nonnegative_count(summary["final_queued_requests"])
+        failed = nonnegative_count(summary["counts"]["failed"])
+        rejected = nonnegative_count(summary["counts"]["rejected"])
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError(
+            "benchmark summary is missing or has invalid sustainability metrics"
+        ) from error
+    sustainable = is_sustainable(
+        target_qps, achieved_qps, ttft_p99_ns, tpot_p99_ns, peak_queued,
+        final_active, final_queued, failed, rejected, args.requests,
+        args.throughput_ratio, args.max_queue_fraction,
+        args.max_p99_ttft_ms * 1_000_000,
+        args.max_p99_tpot_ms * 1_000_000)
+    return ProbeResult(
+        target_qps, achieved_qps, ttft_p99_ns, tpot_p99_ns, peak_queued,
+        final_active, final_queued, failed, rejected, sustainable)
 
 
 def find_max_qps(probe: Callable[[float], ProbeResult], start_qps: float,
@@ -64,8 +116,10 @@ def parse_args():
     parser.add_argument("--max-qps", type=float, default=128.0)
     parser.add_argument("--requests", type=int, default=128)
     parser.add_argument("--binary-steps", type=int, default=4)
-    parser.add_argument("--throughput-ratio", type=float, default=0.90)
+    parser.add_argument("--throughput-ratio", type=float, default=0.98)
     parser.add_argument("--max-queue-fraction", type=float, default=0.25)
+    parser.add_argument("--max-p99-ttft-ms", type=float, default=2000)
+    parser.add_argument("--max-p99-tpot-ms", type=float, default=200)
     parser.add_argument("--output-mode", choices=("natural", "trace-exact"),
                         default="trace-exact")
     parser.add_argument("--context-size", type=int, default=16384)
@@ -86,6 +140,10 @@ def validate_args(args):
         raise ValueError("--throughput-ratio must be in (0, 1]")
     if not (0 <= args.max_queue_fraction <= 1):
         raise ValueError("--max-queue-fraction must be in [0, 1]")
+    if not math.isfinite(args.max_p99_ttft_ms) or args.max_p99_ttft_ms <= 0:
+        raise ValueError("--max-p99-ttft-ms (TTFT) must be finite and positive")
+    if not math.isfinite(args.max_p99_tpot_ms) or args.max_p99_tpot_ms <= 0:
+        raise ValueError("--max-p99-tpot-ms (TPOT) must be finite and positive")
 
 
 def main():
@@ -130,17 +188,10 @@ def main():
             raise RuntimeError(f"benchmark probe failed at {qps:g} QPS: {detail}")
         with (output / "summary.json").open(encoding="utf-8") as stream:
             summary = json.load(stream)
-        achieved = summary.get("achieved_request_qps")
-        peak_queued = summary.get("peak_queued_requests")
-        if achieved is None or peak_queued is None:
-            raise RuntimeError("benchmark summary is missing QPS or queue metrics")
-        sustainable = is_sustainable(
-            qps, float(achieved), int(peak_queued), args.requests,
-            args.throughput_ratio, args.max_queue_fraction)
-        result = ProbeResult(qps, float(achieved), int(peak_queued), sustainable)
+        result = probe_result_from_summary(qps, summary, args)
         results.append(result)
         print(f"achieved {result.achieved_qps:.3f}, peak queue "
-              f"{result.peak_queued}: {'PASS' if sustainable else 'FAIL'}")
+              f"{result.peak_queued}: {'PASS' if result.sustainable else 'FAIL'}")
         return result
 
     try:

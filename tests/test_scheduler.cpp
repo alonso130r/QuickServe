@@ -135,6 +135,82 @@ protected:
   }
 };
 
+class ThrowingPolicy final : public Scheduler {
+public:
+  explicit ThrowingPolicy(Handoff &handoff) : Scheduler(handoff, 32) {}
+
+protected:
+  void build_plan(Plan &) override { throw std::runtime_error("planning failed"); }
+};
+
+void admit(Handoff &handoff, Scheduler &scheduler, RequestId id,
+           std::uint32_t prompt_tokens) {
+  CHECK(scheduler.run_once());
+  Admission admission{};
+  CHECK(handoff.try_take_admission(admission));
+  CHECK(admission.id == id);
+  CHECK(handoff.try_report_admission(
+      {id, prompt_tokens, ErrorCode::None}));
+}
+
+void test_decision_timing_aggregates_only_policy_planning() {
+  Handoff handoff(8);
+  ProbePolicy scheduler(handoff);
+  const std::vector<std::uint64_t> clock_ns{100, 110, 200, 230, 300, 390};
+  std::size_t clock_index = 0;
+  scheduler.set_decision_clock([&] {
+    return RequestState::TimePoint(std::chrono::nanoseconds(
+        clock_ns.at(clock_index++)));
+  });
+
+  for (std::uint64_t duration : {10ULL, 30ULL, 90ULL}) {
+    const RequestId id = scheduler.submit_synthetic(1, 1);
+    admit(handoff, scheduler, id, 1);
+    CHECK(scheduler.run_once());
+    Plan *plan = handoff.consume_plan();
+    CHECK(plan != nullptr);
+    if (plan == nullptr) return;
+    CHECK(handoff.try_report_completion(
+        {id, 1, 1, 0, WorkKind::Prefill, ErrorCode::None, false, true}));
+    handoff.retire_plan(plan);
+    CHECK(scheduler.run_once());
+    Release release{};
+    CHECK(handoff.try_take_release(release));
+    CHECK(handoff.try_acknowledge_release(ReleaseAck{release.id}));
+    CHECK(!scheduler.run_once());
+    (void)duration;
+  }
+
+  const SchedulerDecisionTiming timing = scheduler.decision_timing();
+  CHECK(timing.decision_count == 3);
+  CHECK(timing.mean_decision_time_ns.has_value());
+  CHECK(timing.mean_decision_time_ns == 130.0 / 3.0);
+  CHECK(timing.p95_decision_time_ns == 90);
+  CHECK(timing.p99_decision_time_ns == 90);
+  CHECK(clock_index == clock_ns.size());
+}
+
+void test_throwing_policy_does_not_record_decision_timing() {
+  Handoff handoff(8);
+  ThrowingPolicy scheduler(handoff);
+  std::size_t clock_calls = 0;
+  scheduler.set_decision_clock([&] {
+    ++clock_calls;
+    return RequestState::TimePoint(std::chrono::nanoseconds(clock_calls));
+  });
+  const RequestId id = scheduler.submit_synthetic(1, 1);
+  admit(handoff, scheduler, id, 1);
+  bool threw = false;
+  try {
+    (void)scheduler.run_once();
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+  CHECK(clock_calls == 1);
+  CHECK(scheduler.decision_timing().decision_count == 0);
+}
+
 void test_policy_observes_completed_batch_once() {
   Handoff handoff(8);
   RequestState::TimePoint now{};
@@ -1664,6 +1740,8 @@ void test_terminal_marker_allocation_failure_is_recovered() {
 } // namespace
 
 int main() {
+  test_decision_timing_aggregates_only_policy_planning();
+  test_throwing_policy_does_not_record_decision_timing();
   test_policy_observes_completed_batch_once();
   test_workload_counts_distinguish_queued_and_active();
   test_workload_counts_handle_burst_without_policy_scan();

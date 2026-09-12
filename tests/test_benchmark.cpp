@@ -244,6 +244,15 @@ void test_csv_and_summary_are_valid() {
   CHECK(results.observe_batch(8, 0, 100, true));
   CHECK(results.observe_batch(4, 2, 200, true));
   CHECK(results.observe_batch(0, 2, 50, false));
+  SchedulerDecisionTiming scheduler_timing;
+  scheduler_timing.decision_count = 3;
+  scheduler_timing.mean_decision_time_ns = 130.0 / 3.0;
+  scheduler_timing.p95_decision_time_ns = 90;
+  scheduler_timing.p99_decision_time_ns = 90;
+  results.set_scheduler_decision_timing(scheduler_timing);
+  results.set_peak_resident_memory_bytes(424242);
+  results.sample_counts(50, 2, 3);
+  results.sample_counts(90, 0, 0);
   results.finish(100);
   CHECK(std::filesystem::exists(root / "requests.csv"));
   CHECK(std::filesystem::exists(root / "summary.json"));
@@ -256,6 +265,8 @@ void test_csv_and_summary_are_valid() {
   CHECK(text.find("\"p50_ns\":90") != std::string::npos);
   CHECK(text.find("\"offered_request_qps\"") != std::string::npos);
   CHECK(text.find("\"achieved_request_qps\"") != std::string::npos);
+  CHECK(text.find("\"final_active_requests\":0") != std::string::npos);
+  CHECK(text.find("\"final_queued_requests\":0") != std::string::npos);
   CHECK(text.find("\"input_token_throughput\"") != std::string::npos);
   CHECK(text.find("\"arrival_lag\"") != std::string::npos);
   CHECK(text.find("\"queue_delay\"") != std::string::npos);
@@ -266,6 +277,14 @@ void test_csv_and_summary_are_valid() {
   CHECK(text.find("\"executed_input_tokens\":4") != std::string::npos);
   CHECK(text.find("\"jain_fairness\":1") != std::string::npos);
   CHECK(text.find("\"failure_request_rate\"") != std::string::npos);
+  CHECK(text.find("\"scheduler\":{\"decision_count\":3") !=
+        std::string::npos);
+  CHECK(text.find("\"mean_decision_time_ns\":43.333333333333336") !=
+        std::string::npos);
+  CHECK(text.find("\"p95_decision_time_ns\":90") != std::string::npos);
+  CHECK(text.find("\"p99_decision_time_ns\":90") != std::string::npos);
+  CHECK(text.find("\"peak_resident_memory_bytes\":424242") !=
+        std::string::npos);
   CHECK(text.find("\"batches\":{\"total\":3") != std::string::npos);
   CHECK(text.find("\"pure_prefill\":1") != std::string::npos);
   CHECK(text.find("\"pure_decode\":1") != std::string::npos);

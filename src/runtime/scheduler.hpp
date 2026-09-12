@@ -75,6 +75,13 @@ struct SchedulerWorkloadCounts {
   std::uint64_t queued = 0;
 };
 
+struct SchedulerDecisionTiming {
+  std::uint64_t decision_count{};
+  std::optional<double> mean_decision_time_ns;
+  std::optional<std::uint64_t> p95_decision_time_ns;
+  std::optional<std::uint64_t> p99_decision_time_ns;
+};
+
 struct BatchOutcome {
   std::uint64_t epoch = 0;
   RequestState::TimePoint started_at{};
@@ -132,6 +139,7 @@ public:
   void set_workload_observer(WorkloadObserver observer);
   void set_batch_observer(BatchObserver observer);
   void set_clock(ClockFunction clock);
+  void set_decision_clock(ClockFunction clock);
   bool run_once();
   void run();
   void request_stop();
@@ -139,6 +147,7 @@ public:
   [[nodiscard]] const std::vector<RequestState> &requests() const;
   [[nodiscard]] const SchedulerError &last_error() const;
   [[nodiscard]] SchedulerWorkloadCounts workload_counts() const;
+  [[nodiscard]] SchedulerDecisionTiming decision_timing() const;
 
 protected:
   virtual void build_plan(Plan &out) = 0;
@@ -202,6 +211,8 @@ private:
   ErrorCode drain_error_ = ErrorCode::None;
   SchedulerError last_error_{};
   ClockFunction clock_;
+  ClockFunction decision_clock_;
+  std::vector<std::uint64_t> decision_times_ns_;
   RequestState::TimePoint current_time_{};
   TerminalObserver terminal_observer_;
   bool streaming_retirement_ = false;
