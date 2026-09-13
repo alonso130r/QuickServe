@@ -53,6 +53,7 @@ struct RequestRecord {
   llama_seq_id sequence = 0;
   OutputMode output_mode = OutputMode::Natural;
   bool cacheable = false;
+  std::string conversation_id;
   SamplerPtr sampler;
 };
 
@@ -159,6 +160,9 @@ void Environment::run() {
   std::unordered_map<RequestId, RequestRecord> requests;
   std::vector<PrefixCacheEntry> prefix_cache;
   std::uint64_t cache_clock = 0;
+  const std::uint32_t prefix_cache_capacity =
+      resolve_prefix_cache_capacity(config_.prefix_cache_capacity,
+                                    config_.max_sequences);
   std::optional<llama_token> synthetic_token;
 
   try {
@@ -227,7 +231,7 @@ void Environment::run() {
 
     free_sequences.reserve(config_.max_sequences);
     requests.reserve(config_.max_sequences);
-    prefix_cache.reserve(config_.max_sequences);
+    prefix_cache.reserve(prefix_cache_capacity);
     for (std::uint32_t i = config_.max_sequences; i > 0; --i) {
       free_sequences.push_back(static_cast<llama_seq_id>(i - 1));
     }
@@ -264,24 +268,11 @@ void Environment::run() {
     if (written == 0 || written > state.size())
       return;
     state.resize(written);
-    auto existing = std::find_if(
-        prefix_cache.begin(), prefix_cache.end(), [&](const auto &entry) {
-          return entry.tokens == record.prompt;
-        });
-    PrefixCacheEntry entry{record.prompt, std::move(state), ++cache_clock};
-    if (existing != prefix_cache.end()) {
-      *existing = std::move(entry);
-    } else {
-      if (prefix_cache.size() == config_.max_sequences) {
-        const auto oldest = std::min_element(
-            prefix_cache.begin(), prefix_cache.end(), [](const auto &left,
-                                                         const auto &right) {
-              return left.last_used < right.last_used;
-            });
-        prefix_cache.erase(oldest);
-      }
-      prefix_cache.push_back(std::move(entry));
-    }
+    retain_conversation_prefix(
+        prefix_cache,
+        {record.prompt, std::move(state), ++cache_clock,
+         record.conversation_id},
+        prefix_cache_capacity);
   };
 
   while (!handoff_.stop_requested()) {
@@ -385,6 +376,8 @@ void Environment::run() {
             record.output_mode = pending.admission.output_mode;
             record.cacheable =
                 !pending.admission.synthetic_prompt_tokens.has_value();
+            record.conversation_id =
+                std::move(pending.admission.conversation_id);
             record.sampler = std::move(sampler);
             result.prompt_tokens =
                 static_cast<std::uint32_t>(record.prompt.size());

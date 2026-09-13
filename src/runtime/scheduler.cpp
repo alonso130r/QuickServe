@@ -20,9 +20,12 @@ Scheduler::Scheduler(Handoff &handoff, std::uint32_t token_budget,
 }
 
 RequestId Scheduler::submit(std::string prompt,
-                            std::uint32_t max_output_tokens) {
+                            std::uint32_t max_output_tokens,
+                            OutputMode output_mode,
+                            std::string conversation_id) {
   return submit_admission(
-      Admission{0, std::move(prompt), max_output_tokens});
+      Admission{0, std::move(prompt), max_output_tokens, std::nullopt,
+                output_mode, std::move(conversation_id)});
 }
 
 RequestId Scheduler::submit_synthetic(std::uint32_t prompt_tokens,

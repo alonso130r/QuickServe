@@ -28,15 +28,18 @@ struct Admission {
   std::uint32_t max_output_tokens = 0;
   std::optional<std::uint32_t> synthetic_prompt_tokens;
   OutputMode output_mode = OutputMode::Natural;
+  std::string conversation_id;
 
   Admission() = default;
   Admission(RequestId request_id, std::string request_prompt,
             std::uint32_t output_tokens,
             std::optional<std::uint32_t> synthetic_tokens = std::nullopt,
-            OutputMode mode = OutputMode::Natural)
+            OutputMode mode = OutputMode::Natural,
+            std::string request_conversation_id = {})
       : id(request_id), prompt(std::move(request_prompt)),
         max_output_tokens(output_tokens),
-        synthetic_prompt_tokens(synthetic_tokens), output_mode(mode) {}
+        synthetic_prompt_tokens(synthetic_tokens), output_mode(mode),
+        conversation_id(std::move(request_conversation_id)) {}
 };
 
 struct AdmissionResult {

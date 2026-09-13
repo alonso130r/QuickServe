@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace quickserve::benchmark {
 
@@ -15,9 +16,17 @@ struct TraceHeader {
 };
 
 struct TraceRecord {
+  TraceRecord() = default;
+  TraceRecord(std::uint64_t offset, std::uint32_t context,
+              std::uint32_t generated)
+      : arrival_offset_ns(offset), context_tokens(context),
+        generated_tokens(generated) {}
   std::uint64_t arrival_offset_ns{};
   std::uint32_t context_tokens{};
   std::uint32_t generated_tokens{};
+  std::uint32_t turn_index{};
+  std::string conversation_id;
+  std::string prompt;
 };
 
 class TraceCursor {
@@ -30,11 +39,13 @@ public:
 
 private:
   friend class TraceReader;
-  TraceCursor(const std::filesystem::path &path, const TraceHeader &header);
+  TraceCursor(const std::filesystem::path &path, const TraceHeader &header,
+              bool conversation_trace);
   std::ifstream input_;
   TraceHeader header_;
   std::uint64_t index_{};
   std::uint64_t previous_offset_{};
+  bool conversation_trace_{};
 };
 
 std::string sha256_hex(const std::string &bytes);
@@ -51,6 +62,8 @@ public:
 private:
   std::filesystem::path path_;
   TraceHeader header_;
+  bool conversation_trace_{};
+  std::vector<std::uint64_t> record_offsets_;
 };
 
 } // namespace quickserve::benchmark

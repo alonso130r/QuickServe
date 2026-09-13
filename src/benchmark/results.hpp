@@ -39,10 +39,13 @@ struct RunMetadata {
   std::uint32_t batch_capacity{};
   std::uint32_t max_sequences{};
   std::uint32_t token_budget{};
+  std::uint32_t prefix_cache_capacity{};
 };
 
 struct RequestMetrics {
   std::uint32_t request_id{};
+  std::string conversation_id;
+  std::uint32_t turn_index{};
   std::uint64_t source_offset_ns{};
   std::uint64_t scheduled_arrival_ns{};
   std::uint64_t actual_arrival_ns{};

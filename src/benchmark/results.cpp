@@ -162,14 +162,14 @@ void AtomicResults::begin(const RunMetadata &metadata) {
   if (!std::filesystem::create_directory(temporary_)) throw std::runtime_error("cannot create temporary output directory");
   requests_.open(temporary_ / "requests.csv", std::ios::binary | std::ios::out | std::ios::trunc);
   if (!requests_) throw std::runtime_error("cannot create requests.csv");
-  requests_ << "request_id,source_offset_ns,scheduled_arrival_ns,actual_arrival_ns,arrival_lag_ns,input_tokens,cached_input_tokens,executed_input_tokens,requested_output_tokens,generated_output_tokens,queue_delay_ns,ttft_ns,prefill_ns,decode_span_ns,tpot_ns,e2e_latency_ns,normalized_latency_ns_per_token,terminal_error,terminal_disposition,eog_observed,output_mode\r\n";
+  requests_ << "request_id,conversation_id,turn_index,source_offset_ns,scheduled_arrival_ns,actual_arrival_ns,arrival_lag_ns,input_tokens,cached_input_tokens,executed_input_tokens,requested_output_tokens,generated_output_tokens,queue_delay_ns,ttft_ns,prefill_ns,decode_span_ns,tpot_ns,e2e_latency_ns,normalized_latency_ns_per_token,terminal_error,terminal_disposition,eog_observed,output_mode\r\n";
   metadata_ = metadata;
   begun_ = true;
 }
 
 bool AtomicResults::observe(const RequestMetrics &m) noexcept {
   try {
-    requests_ << m.request_id << ',' << m.source_offset_ns << ',' << m.scheduled_arrival_ns << ','
+    requests_ << m.request_id << ',' << csv_field(m.conversation_id) << ',' << m.turn_index << ',' << m.source_offset_ns << ',' << m.scheduled_arrival_ns << ','
               << m.actual_arrival_ns << ',' << m.arrival_lag_ns << ',' << m.input_tokens << ',' << m.cached_input_tokens << ',' << m.executed_input_tokens << ','
               << m.requested_output_tokens << ',' << m.generated_output_tokens << ','
               << optional_number(m.queue_delay_ns) << ',' << optional_number(m.ttft_ns) << ','
@@ -338,7 +338,8 @@ void AtomicResults::finish(std::uint64_t wall_duration_ns) {
     << "\"environment\":{" << "\"context_size\":" << metadata_.context_size << ','
     << "\"batch_capacity\":" << metadata_.batch_capacity << ','
     << "\"max_sequences\":" << metadata_.max_sequences << ','
-    << "\"token_budget\":" << metadata_.token_budget << "},"
+    << "\"token_budget\":" << metadata_.token_budget << ','
+    << "\"prefix_cache_capacity\":" << metadata_.prefix_cache_capacity << "},"
     << "\"counts\":{" << "\"observed\":" << observed_ << ',' << "\"successful\":" << successful_ << ','
     << "\"failed\":" << failed_ << ',' << "\"rejected\":" << rejected_ << ','
     << "\"admission_rejections\":" << admission_rejections_ << ','

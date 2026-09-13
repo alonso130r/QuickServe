@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import pathlib
+import struct
 import sys
 import urllib.parse
 import urllib.request
@@ -57,8 +58,12 @@ def prepare_conversation(row):
             created = parse_timestamp(assistant.get("timestamp"))
         if created is None:
             return None
+        output_tokens = assistant.get("token_counter")
+        if not isinstance(output_tokens, int) or output_tokens <= 0:
+            return None
         turns.append({
             "assistant": assistant["content"],
+            "output_tokens": output_tokens,
             "request_timestamp": created,
             "turn_id": assistant.get("turn_identifier"),
             "user": user["content"],
@@ -84,12 +89,42 @@ def requests_for_conversation(conversation):
             "conversation_id": conversation["conversation_id"],
             "messages": list(messages),
             "reference_response": turn["assistant"],
+            "reference_output_tokens": turn["output_tokens"],
             "source_model": conversation["model"],
             "turn_id": turn["turn_id"],
             "turn_index": turn_index,
         })
         messages.append({"role": "assistant", "content": turn["assistant"]})
     return requests
+
+
+def render_qwen_prompt(messages):
+    parts = []
+    for message in messages:
+        parts.append(f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n")
+    parts.append("<|im_start|>assistant\n")
+    return "".join(parts)
+
+
+def write_conversation_trace(requests, path, source_path):
+    first_ns = round(float(requests[0]["arrival_timestamp"]) * 1_000_000_000)
+    last_ns = round(float(requests[-1]["arrival_timestamp"]) * 1_000_000_000)
+    digest = bytes.fromhex(sha256(source_path))
+    header = struct.pack("<8sIIIIQqq32s16s", b"QSCONV\0\0", 1, 96, 0, 1,
+                         len(requests), first_ns, last_ns, digest, bytes(16))
+    with path.open("wb") as target:
+        target.write(header)
+        for request in requests:
+            conversation_id = request["conversation_id"].encode("utf-8")
+            if len(conversation_id) > 32:
+                raise ValueError("conversation_id exceeds 32 UTF-8 bytes")
+            prompt = render_qwen_prompt(request["messages"]).encode("utf-8")
+            arrival_ns = round(float(request["arrival_timestamp"]) * 1_000_000_000)
+            target.write(struct.pack(
+                "<QIIII32s", arrival_ns - first_ns,
+                request["reference_output_tokens"], request["turn_index"],
+                len(prompt), 0, conversation_id.ljust(32, b"\0")))
+            target.write(prompt)
 
 
 def sha256(path):
@@ -121,6 +156,8 @@ def write_dataset(conversations, output_dir, source):
     with request_path.open("wb") as target:
         for request in requests:
             target.write(json_bytes(request))
+    trace_path = output_dir / "requests.qsc"
+    write_conversation_trace(requests, trace_path, request_path)
     manifest = {
         "conversation_count": len(conversations),
         "conversation_sha256": sha256(conversation_path),
@@ -130,6 +167,8 @@ def write_dataset(conversations, output_dir, source):
         "last_request_timestamp": requests[-1]["arrival_timestamp"],
         "request_count": len(requests),
         "request_sha256": sha256(request_path),
+        "conversation_trace": trace_path.name,
+        "conversation_trace_sha256": sha256(trace_path),
         "selection": "earliest eligible conversations in source shard order",
         "source": source,
         "timing_note": "request_timestamp uses the paired assistant created field",

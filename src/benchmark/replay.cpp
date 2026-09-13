@@ -124,6 +124,28 @@ void validate_clock_headroom(const Selection &selection, double target_qps,
     throw std::overflow_error("scaled replay deadline exceeds clock headroom");
 }
 
+std::optional<std::uint64_t>
+CausalReplayGate::deadline_ns(const TraceRecord &record) const {
+  const auto nominal = scale_deadline_ns(record.arrival_offset_ns, selection_,
+                                         target_qps_);
+  if (record.conversation_id.empty() || record.turn_index == 0)
+    return nominal;
+  const auto previous = completed_.find(record.conversation_id);
+  if (previous == completed_.end() ||
+      previous->second.turn_index + 1 != record.turn_index)
+    return std::nullopt;
+  const auto previous_nominal = scale_deadline_ns(
+      previous->second.source_offset_ns, selection_, target_qps_);
+  return previous->second.completion_ns + (nominal - previous_nominal);
+}
+
+void CausalReplayGate::complete(const TraceRecord &record,
+                                std::uint64_t completion_ns) {
+  if (!record.conversation_id.empty())
+    completed_[record.conversation_id] =
+        {record.turn_index, record.arrival_offset_ns, completion_ns};
+}
+
 ReplayEngine::ReplayEngine(Selection selection, double target_qps,
                            ClockFunction clock)
     : selection_(selection), target_qps_(target_qps), clock_(std::move(clock)) {

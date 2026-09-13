@@ -14,7 +14,13 @@ struct EnvironmentConfig {
   std::uint32_t context_size = 0;
   std::uint32_t batch_capacity = 0;
   std::uint32_t max_sequences = 0;
+  std::uint32_t prefix_cache_capacity = 0;
 };
+
+[[nodiscard]] constexpr std::uint32_t resolve_prefix_cache_capacity(
+    std::uint32_t configured, std::uint32_t max_sequences) noexcept {
+  return configured == 0 ? max_sequences : configured;
+}
 
 struct EnvironmentStartupResult {
   bool success = false;

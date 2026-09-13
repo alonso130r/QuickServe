@@ -89,6 +89,26 @@ void test_replay_engine_uses_injected_clock_for_due_arrivals() {
   CHECK(replay.elapsed_ns() == 500000000ULL);
 }
 
+void test_causal_replay_waits_for_previous_turn_and_think_time() {
+  const Selection selection{3, 2000000000ULL};
+  CausalReplayGate gate(selection, 2.0);
+  TraceRecord first{0, 1, 1};
+  first.conversation_id = "chat";
+  first.turn_index = 0;
+  TraceRecord second{1000000000ULL, 1, 1};
+  second.conversation_id = "chat";
+  second.turn_index = 1;
+  CHECK(gate.deadline_ns(first) == std::optional<std::uint64_t>{0});
+  CHECK(!gate.deadline_ns(second));
+  gate.complete(first, 700000000ULL);
+  CHECK(gate.deadline_ns(second) ==
+        std::optional<std::uint64_t>{1200000000ULL});
+
+  TraceRecord ordinary{1000000000ULL, 1, 1};
+  CHECK(gate.deadline_ns(ordinary) ==
+        std::optional<std::uint64_t>{500000000ULL});
+}
+
 void test_qps_scaling_is_ties_even_and_checks_edges() {
   const Selection selection{3, 4};
   const auto tie_even_down = scale_deadline_ns(1, selection, 1000000000.0);
@@ -213,6 +233,7 @@ void test_csv_and_summary_are_valid() {
   run.target_qps = 2.0;
   run.selected_requests = 2;
   run.output_mode = "natural";
+  run.prefix_cache_capacity = 64;
   results.begin(run);
   RequestMetrics row;
   row.request_id = 7;
@@ -288,6 +309,7 @@ void test_csv_and_summary_are_valid() {
   CHECK(text.find("\"p99_decision_time_ns\":90") != std::string::npos);
   CHECK(text.find("\"peak_resident_memory_bytes\":424242") !=
         std::string::npos);
+  CHECK(text.find("\"prefix_cache_capacity\":64") != std::string::npos);
   CHECK(text.find("\"batches\":{\"total\":3") != std::string::npos);
   CHECK(text.find("\"pure_prefill\":1") != std::string::npos);
   CHECK(text.find("\"pure_decode\":1") != std::string::npos);
@@ -325,6 +347,7 @@ int main() {
   test_prefix_selection_and_scaling();
   test_zero_duration_multi_request_rejected();
   test_replay_engine_uses_injected_clock_for_due_arrivals();
+  test_causal_replay_waits_for_previous_turn_and_think_time();
   test_qps_scaling_is_ties_even_and_checks_edges();
   test_log_sketch_records_documented_bounds();
   test_publication_refuses_destination_created_after_begin();

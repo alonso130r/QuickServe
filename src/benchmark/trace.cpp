@@ -26,6 +26,7 @@ namespace {
 constexpr std::size_t header_size = 96;
 constexpr std::size_t record_size = 16;
 constexpr std::array<unsigned char, 8> magic{'Q','S','T','R','A','C','E',0};
+constexpr std::array<unsigned char, 8> conversation_magic{'Q','S','C','O','N','V',0,0};
 
 class Sha256 {
 public:
@@ -75,6 +76,28 @@ private:
 std::string hex(const std::array<unsigned char,32> &digest) { std::ostringstream s; s<<std::hex<<std::setfill('0'); for(auto b:digest)s<<std::setw(2)<<unsigned(b); return s.str(); }
 template<class T> void put_le(std::ostream &out,T v){ using U=std::make_unsigned_t<T>;U u=static_cast<U>(v);for(std::size_t i=0;i<sizeof(T);++i)out.put(static_cast<char>(u>>(i*8))); }
 template<class T> T get_le(std::istream &in){using U=std::make_unsigned_t<T>;U u{};for(std::size_t i=0;i<sizeof(T);++i){int c=in.get();if(c==EOF)throw std::runtime_error("truncated trace");u|=U(static_cast<unsigned char>(c))<<(i*8);}return static_cast<T>(u);}
+
+TraceRecord read_conversation_record(std::istream &in) {
+  TraceRecord record;
+  record.arrival_offset_ns = get_le<std::uint64_t>(in);
+  record.generated_tokens = get_le<std::uint32_t>(in);
+  record.turn_index = get_le<std::uint32_t>(in);
+  const auto prompt_size = get_le<std::uint32_t>(in);
+  if (get_le<std::uint32_t>(in) != 0 || prompt_size == 0 ||
+      record.generated_tokens == 0)
+    throw std::runtime_error("invalid conversation trace record");
+  std::array<char, 32> id{};
+  in.read(id.data(), id.size());
+  if (!in) throw std::runtime_error("truncated trace");
+  const auto end = std::find(id.begin(), id.end(), '\0');
+  record.conversation_id.assign(id.begin(), end);
+  if (record.conversation_id.empty())
+    throw std::runtime_error("empty conversation ID");
+  record.prompt.resize(prompt_size);
+  in.read(record.prompt.data(), static_cast<std::streamsize>(prompt_size));
+  if (!in) throw std::runtime_error("truncated trace");
+  return record;
+}
 
 bool hashed_getline(std::ifstream &in, std::string &line, Sha256 &hash) {
   if (!std::getline(in, line)) {
@@ -129,14 +152,21 @@ void prepare_trace(const std::filesystem::path &csv,const std::filesystem::path 
 }
 
 TraceReader::TraceReader(std::filesystem::path path):path_(std::move(path)){
-  std::ifstream in(path_,std::ios::binary);if(!in)throw std::runtime_error("cannot open trace");std::array<unsigned char,8> got{};in.read(reinterpret_cast<char*>(got.data()),got.size());if(got!=magic)throw std::runtime_error("invalid trace magic");if(get_le<std::uint32_t>(in)!=1||get_le<std::uint32_t>(in)!=header_size||get_le<std::uint32_t>(in)!=record_size||get_le<std::uint32_t>(in)!=0)throw std::runtime_error("unsupported trace header");header_.record_count=get_le<std::uint64_t>(in);header_.first_timestamp_ns=get_le<std::int64_t>(in);header_.last_timestamp_ns=get_le<std::int64_t>(in);std::array<unsigned char,32>d{};in.read(reinterpret_cast<char*>(d.data()),d.size());header_.source_sha256_hex=hex(d);std::array<unsigned char,16>r{};in.read(reinterpret_cast<char*>(r.data()),r.size());if(!in||std::any_of(r.begin(),r.end(),[](auto x){return x!=0;}))throw std::runtime_error("invalid reserved bytes");if(header_.record_count==0)throw std::runtime_error("empty trace");if(header_.last_timestamp_ns<header_.first_timestamp_ns)throw std::runtime_error("trace timestamps decrease");if(header_.record_count>(std::numeric_limits<std::uintmax_t>::max()-header_size)/record_size||std::filesystem::file_size(path_)!=header_size+header_.record_count*record_size)throw std::runtime_error("trace size mismatch");
+  std::ifstream in(path_,std::ios::binary);if(!in)throw std::runtime_error("cannot open trace");std::array<unsigned char,8> got{};in.read(reinterpret_cast<char*>(got.data()),got.size());conversation_trace_=got==conversation_magic;if(got!=magic&&!conversation_trace_)throw std::runtime_error("invalid trace magic");const auto version=get_le<std::uint32_t>(in), hs=get_le<std::uint32_t>(in), rs=get_le<std::uint32_t>(in), flags=get_le<std::uint32_t>(in);if(version!=1||hs!=header_size||(conversation_trace_?(rs!=0||flags!=1):(rs!=record_size||flags!=0)))throw std::runtime_error("unsupported trace header");header_.record_count=get_le<std::uint64_t>(in);header_.first_timestamp_ns=get_le<std::int64_t>(in);header_.last_timestamp_ns=get_le<std::int64_t>(in);std::array<unsigned char,32>d{};in.read(reinterpret_cast<char*>(d.data()),d.size());header_.source_sha256_hex=hex(d);std::array<unsigned char,16>r{};in.read(reinterpret_cast<char*>(r.data()),r.size());if(!in||std::any_of(r.begin(),r.end(),[](auto x){return x!=0;}))throw std::runtime_error("invalid reserved bytes");if(header_.record_count==0)throw std::runtime_error("empty trace");if(header_.last_timestamp_ns<header_.first_timestamp_ns)throw std::runtime_error("trace timestamps decrease");
+  if (!conversation_trace_) { if(header_.record_count>(std::numeric_limits<std::uintmax_t>::max()-header_size)/record_size||std::filesystem::file_size(path_)!=header_size+header_.record_count*record_size)throw std::runtime_error("trace size mismatch"); return; }
+  record_offsets_.reserve(static_cast<std::size_t>(header_.record_count));
+  std::uint64_t previous{};
+  for (std::uint64_t i=0;i<header_.record_count;++i) { record_offsets_.push_back(static_cast<std::uint64_t>(in.tellg())); auto record=read_conversation_record(in); if((i==0&&record.arrival_offset_ns!=0)||(i&&record.arrival_offset_ns<previous))throw std::runtime_error("invalid trace record"); previous=record.arrival_offset_ns; }
+  if(in.peek()!=EOF)throw std::runtime_error("trace size mismatch");
+  if(static_cast<__int128>(header_.first_timestamp_ns)+previous!=header_.last_timestamp_ns)throw std::runtime_error("trace timestamp mismatch");
 }
-TraceRecord TraceReader::record(std::uint64_t index)const{if(index>=header_.record_count)throw std::out_of_range("trace record index");std::ifstream in(path_,std::ios::binary);in.seekg(static_cast<std::streamoff>(header_size+index*record_size));return {get_le<std::uint64_t>(in),get_le<std::uint32_t>(in),get_le<std::uint32_t>(in)};}
-TraceCursor TraceReader::cursor() const { return TraceCursor(path_, header_); }
+TraceRecord TraceReader::record(std::uint64_t index)const{if(index>=header_.record_count)throw std::out_of_range("trace record index");std::ifstream in(path_,std::ios::binary);in.seekg(static_cast<std::streamoff>(conversation_trace_?record_offsets_[index]:header_size+index*record_size));if(conversation_trace_)return read_conversation_record(in);TraceRecord result;result.arrival_offset_ns=get_le<std::uint64_t>(in);result.context_tokens=get_le<std::uint32_t>(in);result.generated_tokens=get_le<std::uint32_t>(in);return result;}
+TraceCursor TraceReader::cursor() const { return TraceCursor(path_, header_, conversation_trace_); }
 
 TraceCursor::TraceCursor(const std::filesystem::path &path,
-                         const TraceHeader &header)
-    : input_(path, std::ios::binary), header_(header) {
+                         const TraceHeader &header, bool conversation_trace)
+    : input_(path, std::ios::binary), header_(header),
+      conversation_trace_(conversation_trace) {
   if (!input_) throw std::runtime_error("cannot open trace");
   input_.seekg(static_cast<std::streamoff>(header_size));
   if (!input_) throw std::runtime_error("cannot seek trace records");
@@ -144,11 +174,14 @@ TraceCursor::TraceCursor(const std::filesystem::path &path,
 
 bool TraceCursor::next(TraceRecord &record) {
   if (index_ == header_.record_count) return false;
-  record = {get_le<std::uint64_t>(input_), get_le<std::uint32_t>(input_),
-            get_le<std::uint32_t>(input_)};
+  if (conversation_trace_) record = read_conversation_record(input_);
+  else { record = {}; record.arrival_offset_ns = get_le<std::uint64_t>(input_);
+    record.context_tokens = get_le<std::uint32_t>(input_);
+    record.generated_tokens = get_le<std::uint32_t>(input_); }
   if ((index_ == 0 && record.arrival_offset_ns != 0) ||
       (index_ != 0 && record.arrival_offset_ns < previous_offset_) ||
-      record.context_tokens == 0 || record.generated_tokens == 0) {
+      (!conversation_trace_ && record.context_tokens == 0) ||
+      record.generated_tokens == 0) {
     throw std::runtime_error("invalid trace record");
   }
   previous_offset_ = record.arrival_offset_ns;

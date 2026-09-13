@@ -39,6 +39,60 @@ void write_bytes(const fs::path &path, const std::string &bytes) {
   out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
+template <typename T> void append_le(std::string &bytes, T value) {
+  using U = std::make_unsigned_t<T>;
+  const U converted = static_cast<U>(value);
+  for (std::size_t index = 0; index < sizeof(T); ++index)
+    bytes.push_back(static_cast<char>(converted >> (index * 8)));
+}
+
+void append_conversation_record(std::string &bytes, std::uint64_t offset,
+                                std::uint32_t output_tokens,
+                                std::uint32_t turn_index,
+                                const std::string &conversation_id,
+                                const std::string &prompt) {
+  append_le(bytes, offset);
+  append_le(bytes, output_tokens);
+  append_le(bytes, turn_index);
+  append_le(bytes, static_cast<std::uint32_t>(prompt.size()));
+  append_le(bytes, std::uint32_t{0});
+  bytes.append(conversation_id);
+  bytes.append(32 - conversation_id.size(), '\0');
+  bytes.append(prompt);
+}
+
+void test_reads_conversation_trace() {
+  const auto dir = temp_dir();
+  const auto path = dir / "requests.qsc";
+  std::string bytes("QSCONV\0\0", 8);
+  append_le(bytes, std::uint32_t{1});
+  append_le(bytes, std::uint32_t{96});
+  append_le(bytes, std::uint32_t{0});
+  append_le(bytes, std::uint32_t{1});
+  append_le(bytes, std::uint64_t{2});
+  append_le(bytes, std::int64_t{1000});
+  append_le(bytes, std::int64_t{1010});
+  bytes.append(48, '\0');
+  append_conversation_record(bytes, 0, 7, 0, "chat-a", "prompt one");
+  append_conversation_record(bytes, 10, 9, 1, "chat-a", "prompt two");
+  write_bytes(path, bytes);
+
+  TraceReader reader(path);
+  CHECK(reader.header().record_count == 2);
+  CHECK(reader.record(0).conversation_id == "chat-a");
+  CHECK(reader.record(1).turn_index == 1);
+  CHECK(reader.record(1).generated_tokens == 9);
+  CHECK(reader.record(1).prompt == "prompt two");
+  auto cursor = reader.cursor();
+  TraceRecord record;
+  CHECK(cursor.next(record));
+  CHECK(record.prompt == "prompt one");
+  CHECK(cursor.next(record));
+  CHECK(record.arrival_offset_ns == 10);
+  CHECK(!cursor.next(record));
+  fs::remove_all(dir);
+}
+
 void test_sha256_vectors() {
   CHECK(sha256_hex("") == "e3b0c44298fc1c149afbf4c8996fb924"
                            "27ae41e4649b934ca495991b7852b855");
@@ -167,6 +221,7 @@ void test_cursor_rejects_nonzero_first_offset() {
 
 int main() {
   test_sha256_vectors();
+  test_reads_conversation_trace();
   test_prepare_and_read_normative_layout();
   test_rejects_bad_csv_and_preserves_destination();
   test_reader_rejects_corruption_and_truncation();

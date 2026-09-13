@@ -7,6 +7,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 namespace quickserve::benchmark {
 
@@ -28,6 +29,25 @@ std::uint64_t scale_deadline_ns(std::uint64_t source_offset_ns,
 double offered_qps(const Selection &selection, double target_qps);
 void validate_clock_headroom(const Selection &selection, double target_qps,
                              std::chrono::steady_clock::time_point start);
+
+class CausalReplayGate {
+public:
+  CausalReplayGate(Selection selection, double target_qps)
+      : selection_(selection), target_qps_(target_qps) {}
+  [[nodiscard]] std::optional<std::uint64_t>
+  deadline_ns(const TraceRecord &record) const;
+  void complete(const TraceRecord &record, std::uint64_t completion_ns);
+
+private:
+  struct CompletedTurn {
+    std::uint32_t turn_index{};
+    std::uint64_t source_offset_ns{};
+    std::uint64_t completion_ns{};
+  };
+  Selection selection_;
+  double target_qps_{};
+  std::unordered_map<std::string, CompletedTurn> completed_;
+};
 
 class ReplayEngine {
 public:

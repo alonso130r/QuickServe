@@ -4,13 +4,39 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 struct PrefixCacheEntry {
   std::vector<Token> tokens;
   std::vector<std::uint8_t> state;
   std::uint64_t last_used = 0;
+  std::string conversation_id;
 };
+
+inline void retain_conversation_prefix(
+    std::vector<PrefixCacheEntry> &entries, PrefixCacheEntry entry,
+    std::size_t capacity) {
+  if (!entry.conversation_id.empty()) {
+    const auto existing = std::find_if(
+        entries.begin(), entries.end(), [&](const PrefixCacheEntry &candidate) {
+          return candidate.conversation_id == entry.conversation_id;
+        });
+    if (existing != entries.end()) {
+      *existing = std::move(entry);
+      return;
+    }
+  }
+  if (entries.size() == capacity) {
+    const auto oldest = std::min_element(
+        entries.begin(), entries.end(), [](const PrefixCacheEntry &left,
+                                           const PrefixCacheEntry &right) {
+          return left.last_used < right.last_used;
+        });
+    entries.erase(oldest);
+  }
+  entries.push_back(std::move(entry));
+}
 
 inline const PrefixCacheEntry *find_longest_full_prefix(
     const std::vector<PrefixCacheEntry> &entries,

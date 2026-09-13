@@ -60,6 +60,7 @@ struct Options {
   std::uint32_t batch_capacity = 512;
   std::uint32_t max_sequences = 16;
   std::uint32_t token_budget = 512;
+  std::uint32_t prefix_cache_capacity = 0;
 };
 
 std::uint64_t unsigned_value(const std::string &name, const std::string &text,
@@ -99,6 +100,7 @@ Options parse_options(int argc, char **argv) {
     else if (key == "--batch-capacity") options.batch_capacity = unsigned_value(key, value, UINT32_MAX);
     else if (key == "--max-sequences") options.max_sequences = unsigned_value(key, value, UINT32_MAX);
     else if (key == "--token-budget") options.token_budget = unsigned_value(key, value, UINT32_MAX);
+    else if (key == "--prefix-cache-capacity") options.prefix_cache_capacity = unsigned_value(key, value, UINT32_MAX);
     else throw std::invalid_argument("unknown argument: " + key);
   }
   if (options.trace.empty() || options.model.empty() || options.output_dir.empty() || options.target_qps == 0)
@@ -213,6 +215,8 @@ int run(const Options &options) {
   metadata.batch_capacity = options.batch_capacity;
   metadata.max_sequences = options.max_sequences;
   metadata.token_budget = options.token_budget;
+  metadata.prefix_cache_capacity = resolve_prefix_cache_capacity(
+      options.prefix_cache_capacity, options.max_sequences);
 
   qb::AtomicResults results(options.output_dir);
   results.begin(metadata);
@@ -220,7 +224,8 @@ int run(const Options &options) {
       64, static_cast<std::size_t>(options.max_sequences) * 4);
   Handoff handoff(options.token_budget, 3, queue_capacity);
   Environment environment(handoff, {options.model.string(), options.context_size,
-                                     options.batch_capacity, options.max_sequences});
+                                     options.batch_capacity, options.max_sequences,
+                                     options.prefix_cache_capacity});
   std::thread environment_thread([&] { environment.run(); });
   std::thread replay_thread;
   WorkerGuard workers(handoff, environment_thread, replay_thread);
@@ -240,8 +245,9 @@ int run(const Options &options) {
       const Scheduler::ClockFunction clock = [] { return RequestState::Clock::now(); };
       std::unordered_map<RequestId, ActiveMetadata> active_metadata;
       std::uint64_t submitted = 0;
+      std::uint64_t loaded = 0;
       std::uint64_t observed = 0;
-      std::uint64_t last_submitted_source_offset = 0;
+      std::uint64_t last_loaded_source_offset = 0;
       bool output_ok = true;
       RequestState::TimePoint start{};
       scheduler = quickserve_benchmark_adapter::create(
@@ -249,6 +255,9 @@ int run(const Options &options) {
           *hardware_profile, options.policy_config);
       if (!scheduler) throw std::runtime_error("policy factory returned null");
       scheduler->set_clock(clock);
+      qb::ReplayEngine replay(selection, options.target_qps, clock);
+      qb::CausalReplayGate causal_gate(selection, options.target_qps);
+      start = replay.start();
       scheduler->set_workload_observer([&](RequestState::TimePoint at,
                                             SchedulerWorkloadCounts counts) {
         results.sample_counts(ns_since(start, at), counts.active, counts.queued);
@@ -270,11 +279,13 @@ int run(const Options &options) {
           const ActiveMetadata meta = found->second;
           qb::RequestMetrics row;
           row.request_id = state.id;
+          row.conversation_id = meta.record.conversation_id;
+          row.turn_index = meta.record.turn_index;
           row.source_offset_ns = meta.record.arrival_offset_ns;
           row.scheduled_arrival_ns = meta.scheduled_ns;
           row.actual_arrival_ns = ns_since(start, state.arrival_time);
           row.arrival_lag_ns = checked_arrival_lag(row.actual_arrival_ns, row.scheduled_arrival_ns);
-          row.input_tokens = meta.record.context_tokens;
+          row.input_tokens = state.prompt_length;
           row.cached_input_tokens = state.cached_prefix_tokens;
           row.executed_input_tokens =
               state.prefill_position - state.cached_prefix_tokens;
@@ -297,7 +308,12 @@ int run(const Options &options) {
           row.eog_observed = state.eog_observed;
           row.output_mode = options.output_mode_name;
           output_ok = results.observe(row);
-          if (output_ok) { active_metadata.erase(found); ++observed; }
+          if (output_ok) {
+            causal_gate.complete(meta.record,
+                                 ns_since(start, state.finish_time));
+            active_metadata.erase(found);
+            ++observed;
+          }
           return output_ok;
         } catch (...) {
           output_ok = false;
@@ -309,44 +325,68 @@ int run(const Options &options) {
       qb::TraceRecord next;
       bool has_next = cursor.next(next);
       if (!has_next) throw std::runtime_error("trace changed before replay");
-      qb::ReplayEngine replay(selection, options.target_qps, clock);
-      start = replay.start();
+      std::vector<qb::TraceRecord> pending;
       auto last_progress = start - std::chrono::seconds(2);
-      while (output_ok && (submitted < selection.count || observed < submitted)) {
+      while (output_ok &&
+             (loaded < selection.count || !pending.empty() ||
+              observed < submitted)) {
         auto now = replay.now();
         if (now - last_progress >= std::chrono::seconds(2)) {
           print_progress(submitted, observed, selection.count, start, now);
           last_progress = now;
         }
         std::uint64_t elapsed_ns = replay.elapsed_ns();
-        while (output_ok && submitted < selection.count && has_next) {
+        while (output_ok && loaded < selection.count && has_next) {
           const auto deadline_ns = replay.deadline_ns(next);
           if (deadline_ns > elapsed_ns) break;
-          const RequestId id = scheduler->submit_synthetic(next.context_tokens, next.generated_tokens, options.output_mode);
-          active_metadata.emplace(id, ActiveMetadata{next, deadline_ns});
-          last_submitted_source_offset = next.arrival_offset_ns;
-          ++submitted;
-          if (submitted < selection.count) {
+          last_loaded_source_offset = next.arrival_offset_ns;
+          pending.push_back(std::move(next));
+          ++loaded;
+          if (loaded < selection.count) {
             has_next = cursor.next(next);
             if (!has_next) throw std::runtime_error("trace changed during replay");
           } else {
             has_next = false;
           }
-          now = replay.now();
+          elapsed_ns = replay.elapsed_ns();
+        }
+        for (auto item = pending.begin(); item != pending.end();) {
+          const auto deadline_ns = causal_gate.deadline_ns(*item);
+          if (!deadline_ns || *deadline_ns > elapsed_ns) {
+            ++item;
+            continue;
+          }
+          const RequestId id = item->prompt.empty()
+              ? scheduler->submit_synthetic(item->context_tokens,
+                                            item->generated_tokens,
+                                            options.output_mode)
+              : scheduler->submit(item->prompt, item->generated_tokens,
+                                  options.output_mode,
+                                  item->conversation_id);
+          active_metadata.emplace(id, ActiveMetadata{*item, *deadline_ns});
+          ++submitted;
+          item = pending.erase(item);
           elapsed_ns = replay.elapsed_ns();
         }
         const auto snapshot = handoff.scheduler_progress_generation();
         (void)scheduler->run_once();
         if (!output_ok) break;
-        if (submitted == selection.count && observed == submitted) break;
+        if (loaded == selection.count && pending.empty() &&
+            observed == submitted) break;
         auto deadline = replay.now() + std::chrono::milliseconds(10);
-        if (submitted < selection.count && has_next) {
-          deadline = replay.deadline(next);
+        if (loaded < selection.count && has_next) {
+          deadline = std::min(deadline, replay.deadline(next));
+        }
+        for (const auto &record : pending) {
+          const auto causal_deadline = causal_gate.deadline_ns(record);
+          if (causal_deadline)
+            deadline = std::min(
+                deadline, start + std::chrono::nanoseconds(*causal_deadline));
         }
         (void)handoff.wait_for_scheduler_progress(snapshot, deadline);
       }
-      if (submitted != selection.count ||
-          last_submitted_source_offset != selection.final_source_offset_ns)
+      if (loaded != selection.count || submitted != selection.count ||
+          last_loaded_source_offset != selection.final_source_offset_ns)
         throw std::runtime_error("replay trace no longer matches validated prefix");
       if (!output_ok) scheduler->request_stop();
       while (!scheduler->all_terminal()) (void)scheduler->run_once();

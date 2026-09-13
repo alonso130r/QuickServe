@@ -132,7 +132,9 @@ public:
   Scheduler(Scheduler &&) = delete;
   Scheduler &operator=(Scheduler &&) = delete;
 
-  RequestId submit(std::string prompt, std::uint32_t max_output_tokens);
+  RequestId submit(std::string prompt, std::uint32_t max_output_tokens,
+                   OutputMode output_mode = OutputMode::Natural,
+                   std::string conversation_id = {});
   RequestId submit_synthetic(std::uint32_t prompt_tokens,
                              std::uint32_t max_output_tokens,
                              OutputMode output_mode = OutputMode::Natural);

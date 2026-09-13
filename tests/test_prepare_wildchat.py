@@ -14,13 +14,15 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def turn(role, content, identifier, created=None, redacted=False):
+def turn(role, content, identifier, created=None, redacted=False,
+         token_counter=None):
     return {
         "role": role,
         "content": content,
         "turn_identifier": identifier,
         "created": created,
         "redacted": redacted,
+        "token_counter": token_counter,
     }
 
 
@@ -33,7 +35,7 @@ class PrepareWildChatTests(unittest.TestCase):
                 turn("user", f"question {index}", identifier,
                      redacted=redacted and index == 0),
                 turn("assistant", f"answer {index}", identifier,
-                     created=1_700_000_000 + index),
+                     created=1_700_000_000 + index, token_counter=10 + index),
             ])
         return {
             "conversation_hash": "abc",
@@ -64,6 +66,7 @@ class PrepareWildChatTests(unittest.TestCase):
                           "question 2"])
         self.assertEqual(requests[2]["arrival_timestamp"], 1_700_000_002)
         self.assertEqual(requests[2]["reference_response"], "answer 2")
+        self.assertEqual(requests[2]["reference_output_tokens"], 12)
 
     def test_writer_is_deterministic_and_orders_requests_by_arrival(self):
         later = MODULE.prepare_conversation(self.row())
@@ -84,6 +87,10 @@ class PrepareWildChatTests(unittest.TestCase):
             self.assertIn('"conversation_id":"earlier"', lines[0])
             self.assertEqual((first / "manifest.json").read_bytes(),
                              (second / "manifest.json").read_bytes())
+            self.assertEqual((first / "requests.qsc").read_bytes(),
+                             (second / "requests.qsc").read_bytes())
+            self.assertEqual((first / "requests.qsc").read_bytes()[:8],
+                             b"QSCONV\0\0")
 
 
 if __name__ == "__main__":
