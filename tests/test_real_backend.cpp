@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
       std::numeric_limits<std::uint32_t>::max(),
       /*max_output_tokens=*/1, OutputMode::TraceExact);
   const RequestId first = scheduler.submit("The capital of France is", 8);
-  const RequestId second = scheduler.submit("The opposite of hot is", 8);
+  const RequestId second = scheduler.submit("The capital of France is Paris.", 8);
   const RequestId synthetic = scheduler.submit_synthetic(
       /*prompt_tokens=*/11, /*max_output_tokens=*/3,
       OutputMode::TraceExact);
@@ -114,6 +114,7 @@ int main(int argc, char **argv) {
     CHECK(second_state.stage == RequestState::Stage::Terminal);
     CHECK(first_state.terminal_error == ErrorCode::None);
     CHECK(second_state.terminal_error == ErrorCode::None);
+    CHECK(second_state.cached_prefix_tokens == first_state.prompt_length);
     CHECK(synthetic_state.terminal_error == ErrorCode::None);
     CHECK(first_state.decoded_count >= 1);
     CHECK(second_state.decoded_count >= 1);

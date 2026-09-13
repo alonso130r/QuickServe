@@ -358,6 +358,8 @@ void Scheduler::drain_admission_results() {
     state.admission_succeeded = true;
     ++workload_counts_.active;
     state.prompt_length = result.prompt_tokens;
+    state.cached_prefix_tokens = result.cached_prefix_tokens;
+    state.prefill_position = result.cached_prefix_tokens;
     if (draining_ || state.max_output_tokens == 0) {
       move_to_pending_release(state,
                               draining_ ? drain_error_ : ErrorCode::None);

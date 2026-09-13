@@ -1,5 +1,6 @@
 #include "environment.hpp"
 #include "model_profile.hpp"
+#include "prefix_cache.hpp"
 
 #include <ggml.h>
 #include <llama.h>
@@ -51,6 +52,7 @@ struct RequestRecord {
   llama_token last_token = 0;
   llama_seq_id sequence = 0;
   OutputMode output_mode = OutputMode::Natural;
+  bool cacheable = false;
   SamplerPtr sampler;
 };
 
@@ -155,6 +157,8 @@ void Environment::run() {
   std::unique_ptr<BatchGuard> storage;
   std::vector<llama_seq_id> free_sequences;
   std::unordered_map<RequestId, RequestRecord> requests;
+  std::vector<PrefixCacheEntry> prefix_cache;
+  std::uint64_t cache_clock = 0;
   std::optional<llama_token> synthetic_token;
 
   try {
@@ -223,6 +227,7 @@ void Environment::run() {
 
     free_sequences.reserve(config_.max_sequences);
     requests.reserve(config_.max_sequences);
+    prefix_cache.reserve(config_.max_sequences);
     for (std::uint32_t i = config_.max_sequences; i > 0; --i) {
       free_sequences.push_back(static_cast<llama_seq_id>(i - 1));
     }
@@ -245,6 +250,38 @@ void Environment::run() {
     RunFatal message{error};
     retry(message,
           [this](const RunFatal &m) { return handoff_.try_report_fatal(m); });
+  };
+  auto remember_prefix = [&](const RequestRecord &record) {
+    if (!record.cacheable || record.prompt.empty())
+      return;
+    const std::size_t size =
+        llama_state_seq_get_size(context.get(), record.sequence);
+    if (size == 0)
+      return;
+    std::vector<std::uint8_t> state(size);
+    const std::size_t written = llama_state_seq_get_data(
+        context.get(), state.data(), state.size(), record.sequence);
+    if (written == 0 || written > state.size())
+      return;
+    state.resize(written);
+    auto existing = std::find_if(
+        prefix_cache.begin(), prefix_cache.end(), [&](const auto &entry) {
+          return entry.tokens == record.prompt;
+        });
+    PrefixCacheEntry entry{record.prompt, std::move(state), ++cache_clock};
+    if (existing != prefix_cache.end()) {
+      *existing = std::move(entry);
+    } else {
+      if (prefix_cache.size() == config_.max_sequences) {
+        const auto oldest = std::min_element(
+            prefix_cache.begin(), prefix_cache.end(), [](const auto &left,
+                                                         const auto &right) {
+              return left.last_used < right.last_used;
+            });
+        prefix_cache.erase(oldest);
+      }
+      prefix_cache.push_back(std::move(entry));
+    }
   };
 
   while (!handoff_.stop_requested()) {
@@ -346,10 +383,34 @@ void Environment::run() {
             record.sequence = free_sequences.back();
             free_sequences.pop_back();
             record.output_mode = pending.admission.output_mode;
+            record.cacheable =
+                !pending.admission.synthetic_prompt_tokens.has_value();
             record.sampler = std::move(sampler);
             result.prompt_tokens =
                 static_cast<std::uint32_t>(record.prompt.size());
-            requests.emplace(pending.admission.id, std::move(record));
+            if (record.cacheable) {
+              PrefixCacheEntry *match =
+                  find_longest_full_prefix(prefix_cache, record.prompt);
+              if (match != nullptr) {
+                if (llama_state_seq_set_data(
+                        context.get(), match->state.data(), match->state.size(),
+                        record.sequence) != 0) {
+                  record.prefill_position =
+                      static_cast<std::uint32_t>(match->tokens.size());
+                  result.cached_prefix_tokens = record.prefill_position;
+                  match->last_used = ++cache_clock;
+                } else if (!llama_memory_seq_rm(
+                               llama_get_memory(context.get()),
+                               record.sequence, -1, -1)) {
+                  fail_run(ErrorCode::DecodeFailed);
+                  result.error = ErrorCode::DecodeFailed;
+                }
+              }
+            }
+            if (result.error == ErrorCode::None)
+              requests.emplace(pending.admission.id, std::move(record));
+            else
+              free_sequences.push_back(record.sequence);
           }
         }
         retry(result, [this](const AdmissionResult &m) {
@@ -428,6 +489,8 @@ void Environment::run() {
                     : static_cast<std::uint32_t>(item.record->prompt.size());
             if (item.work.kind == WorkKind::Prefill) {
               item.record->prefill_position = item.work.token_end;
+              if (item.record->prefill_position == item.record->prompt.size())
+                remember_prefix(*item.record);
             }
             completion.decoded_tokens = item.record->decoded_tokens;
             if (item.logits_row >= 0) {

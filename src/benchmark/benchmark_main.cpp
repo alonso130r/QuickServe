@@ -275,7 +275,9 @@ int run(const Options &options) {
           row.actual_arrival_ns = ns_since(start, state.arrival_time);
           row.arrival_lag_ns = checked_arrival_lag(row.actual_arrival_ns, row.scheduled_arrival_ns);
           row.input_tokens = meta.record.context_tokens;
-          row.executed_input_tokens = state.prefill_position;
+          row.cached_input_tokens = state.cached_prefix_tokens;
+          row.executed_input_tokens =
+              state.prefill_position - state.cached_prefix_tokens;
           row.requested_output_tokens = meta.record.generated_tokens;
           row.generated_output_tokens = state.decoded_count;
           row.queue_delay_ns = elapsed(state.arrival_time, true, state.start_time, state.start_recorded);

@@ -220,6 +220,7 @@ void test_csv_and_summary_are_valid() {
   row.scheduled_arrival_ns = 0;
   row.actual_arrival_ns = 10;
   row.input_tokens = 4;
+  row.cached_input_tokens = 2;
   row.requested_output_tokens = 2;
   row.generated_output_tokens = 1;
   row.executed_input_tokens = 4;
@@ -233,6 +234,7 @@ void test_csv_and_summary_are_valid() {
   RequestMetrics rejected = row;
   rejected.request_id = 8;
   rejected.input_tokens = 100;
+  rejected.cached_input_tokens = 0;
   rejected.executed_input_tokens = 0;
   rejected.generated_output_tokens = 0;
   rejected.e2e_latency_ns.reset();
@@ -275,6 +277,7 @@ void test_csv_and_summary_are_valid() {
   CHECK(text.find("\"input_buckets\"") != std::string::npos);
   CHECK(text.find("\"admission_rejections\":1") != std::string::npos);
   CHECK(text.find("\"executed_input_tokens\":4") != std::string::npos);
+  CHECK(text.find("\"cached_input_tokens\":2") != std::string::npos);
   CHECK(text.find("\"jain_fairness\":1") != std::string::npos);
   CHECK(text.find("\"failure_request_rate\"") != std::string::npos);
   CHECK(text.find("\"scheduler\":{\"decision_count\":3") !=

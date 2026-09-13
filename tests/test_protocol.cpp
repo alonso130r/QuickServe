@@ -56,6 +56,7 @@ void test_messages_have_deterministic_defaults() {
   const AdmissionResult admission_result{};
   CHECK(admission_result.id == 0);
   CHECK(admission_result.prompt_tokens == 0);
+  CHECK(admission_result.cached_prefix_tokens == 0);
   CHECK(admission_result.error == ErrorCode::None);
 
   const WorkItem work{};

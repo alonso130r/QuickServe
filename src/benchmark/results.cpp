@@ -162,7 +162,7 @@ void AtomicResults::begin(const RunMetadata &metadata) {
   if (!std::filesystem::create_directory(temporary_)) throw std::runtime_error("cannot create temporary output directory");
   requests_.open(temporary_ / "requests.csv", std::ios::binary | std::ios::out | std::ios::trunc);
   if (!requests_) throw std::runtime_error("cannot create requests.csv");
-  requests_ << "request_id,source_offset_ns,scheduled_arrival_ns,actual_arrival_ns,arrival_lag_ns,input_tokens,executed_input_tokens,requested_output_tokens,generated_output_tokens,queue_delay_ns,ttft_ns,prefill_ns,decode_span_ns,tpot_ns,e2e_latency_ns,normalized_latency_ns_per_token,terminal_error,terminal_disposition,eog_observed,output_mode\r\n";
+  requests_ << "request_id,source_offset_ns,scheduled_arrival_ns,actual_arrival_ns,arrival_lag_ns,input_tokens,cached_input_tokens,executed_input_tokens,requested_output_tokens,generated_output_tokens,queue_delay_ns,ttft_ns,prefill_ns,decode_span_ns,tpot_ns,e2e_latency_ns,normalized_latency_ns_per_token,terminal_error,terminal_disposition,eog_observed,output_mode\r\n";
   metadata_ = metadata;
   begun_ = true;
 }
@@ -170,7 +170,7 @@ void AtomicResults::begin(const RunMetadata &metadata) {
 bool AtomicResults::observe(const RequestMetrics &m) noexcept {
   try {
     requests_ << m.request_id << ',' << m.source_offset_ns << ',' << m.scheduled_arrival_ns << ','
-              << m.actual_arrival_ns << ',' << m.arrival_lag_ns << ',' << m.input_tokens << ',' << m.executed_input_tokens << ','
+              << m.actual_arrival_ns << ',' << m.arrival_lag_ns << ',' << m.input_tokens << ',' << m.cached_input_tokens << ',' << m.executed_input_tokens << ','
               << m.requested_output_tokens << ',' << m.generated_output_tokens << ','
               << optional_number(m.queue_delay_ns) << ',' << optional_number(m.ttft_ns) << ','
               << optional_number(m.prefill_ns) << ',' << optional_number(m.decode_span_ns) << ','
@@ -184,6 +184,7 @@ bool AtomicResults::observe(const RequestMetrics &m) noexcept {
     if (m.ttft_ns) ttft_.add(*m.ttft_ns);
     if (m.tpot_ns) tpot_.add(*m.tpot_ns);
     input_tokens_ += m.executed_input_tokens;
+    cached_input_tokens_ += m.cached_input_tokens;
     output_tokens_ += m.generated_output_tokens;
     if (!has_arrival_) { first_arrival_ns_ = m.actual_arrival_ns; has_arrival_ = true; }
     else first_arrival_ns_ = std::min(first_arrival_ns_, m.actual_arrival_ns);
@@ -345,6 +346,7 @@ void AtomicResults::finish(std::uint64_t wall_duration_ns) {
     << "\"wall_duration_ns\":" << wall_duration_ns << ','
     << "\"peak_resident_memory_bytes\":" << peak_rss_bytes << ','
     << "\"executed_input_tokens\":" << input_tokens_ << ','
+    << "\"cached_input_tokens\":" << cached_input_tokens_ << ','
     << "\"generated_output_tokens\":" << output_tokens_ << ','
     << "\"offered_request_qps\":" << (metadata_.offered_request_qps ? std::to_string(*metadata_.offered_request_qps) : "null") << ','
     << "\"achieved_request_qps\":" << (successful_ && last_success_terminal_ns_ > first_arrival_ns_ ? std::to_string(static_cast<double>(successful_) * 1e9 / (last_success_terminal_ns_ - first_arrival_ns_)) : "null") << ','

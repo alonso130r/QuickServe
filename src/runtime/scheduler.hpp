@@ -38,6 +38,7 @@ struct RequestState {
   bool admission_succeeded = false;
   std::uint32_t prompt_length = 0;
   std::uint32_t prefill_position = 0;
+  std::uint32_t cached_prefix_tokens = 0;
   std::uint32_t decoded_count = 0;
   std::uint32_t max_output_tokens = 0;
   std::optional<std::uint32_t> synthetic_prompt_tokens;

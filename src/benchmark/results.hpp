@@ -48,6 +48,7 @@ struct RequestMetrics {
   std::uint64_t actual_arrival_ns{};
   std::int64_t arrival_lag_ns{};
   std::uint32_t input_tokens{};
+  std::uint32_t cached_input_tokens{};
   std::uint32_t executed_input_tokens{};
   std::uint32_t requested_output_tokens{};
   std::uint32_t generated_output_tokens{};
@@ -106,6 +107,7 @@ private:
   LogSketch tpot_;
   LogSketch e2e_;
   std::uint64_t input_tokens_{};
+  std::uint64_t cached_input_tokens_{};
   std::uint64_t output_tokens_{};
   std::uint64_t first_arrival_ns_{};
   std::uint64_t last_success_terminal_ns_{};

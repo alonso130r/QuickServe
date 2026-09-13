@@ -43,6 +43,7 @@ struct AdmissionResult {
   RequestId id = 0;
   std::uint32_t prompt_tokens = 0;
   ErrorCode error = ErrorCode::None;
+  std::uint32_t cached_prefix_tokens = 0;
 };
 
 struct WorkItem {

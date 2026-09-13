@@ -82,6 +82,16 @@ add_executable(test_continuous_batched_fifo
 )
 configure_model_free_test(test_continuous_batched_fifo continuous_batched_fifo)
 
+add_executable(test_cache_aware_continuous_fifo
+    test_cache_aware_continuous_fifo.cpp
+    ${CMAKE_SOURCE_DIR}/src/policies/cache_aware_continuous_fifo.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/scheduler.cpp
+)
+configure_model_free_test(test_cache_aware_continuous_fifo cache_aware_continuous_fifo)
+
+add_executable(test_prefix_cache test_prefix_cache.cpp)
+configure_model_free_test(test_prefix_cache prefix_cache)
+
 if(QUICKSERVE_BUILD_PROXQP_POLICY)
     add_executable(test_proxqp_solver test_proxqp_solver.cpp)
     target_link_libraries(test_proxqp_solver PRIVATE quickserve_proxqp_solver)
