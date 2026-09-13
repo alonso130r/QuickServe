@@ -25,19 +25,46 @@ class ProbeResult(NamedTuple):
     sustainable: bool
 
 
+def sustainability_failures(target_qps, achieved_qps, ttft_p99_ns,
+                            tpot_p99_ns, peak_queued, final_active,
+                            final_queued, failed, rejected, requests,
+                            throughput_ratio, queue_fraction,
+                            max_p99_ttft_ns, max_p99_tpot_ns):
+    queue_limit = max(8, math.floor(requests * queue_fraction))
+    failures = []
+    minimum_qps = target_qps * throughput_ratio
+    if achieved_qps < minimum_qps:
+        failures.append(f"achieved QPS {achieved_qps:.3f} < {minimum_qps:.3f}")
+    if ttft_p99_ns > max_p99_ttft_ns:
+        failures.append(
+            f"p99 TTFT {ttft_p99_ns / 1_000_000:.1f} ms > "
+            f"{max_p99_ttft_ns / 1_000_000:.1f} ms")
+    if tpot_p99_ns > max_p99_tpot_ns:
+        failures.append(
+            f"p99 TPOT {tpot_p99_ns / 1_000_000:.1f} ms > "
+            f"{max_p99_tpot_ns / 1_000_000:.1f} ms")
+    if peak_queued > queue_limit:
+        failures.append(f"peak queue {peak_queued} > {queue_limit}")
+    if final_active != 0:
+        failures.append(f"final active requests {final_active} != 0")
+    if final_queued != 0:
+        failures.append(f"final queued requests {final_queued} != 0")
+    if failed != 0:
+        failures.append(f"failed requests {failed} > 0")
+    if rejected != 0:
+        failures.append(f"rejected requests {rejected} > 0")
+    return failures
+
+
 def is_sustainable(target_qps, achieved_qps, ttft_p99_ns, tpot_p99_ns,
                    peak_queued, final_active, final_queued, failed, rejected,
                    requests, throughput_ratio, queue_fraction,
                    max_p99_ttft_ns, max_p99_tpot_ns):
-    queue_limit = max(8, math.floor(requests * queue_fraction))
-    return (achieved_qps >= target_qps * throughput_ratio
-            and ttft_p99_ns <= max_p99_ttft_ns
-            and tpot_p99_ns <= max_p99_tpot_ns
-            and peak_queued <= queue_limit
-            and final_active == 0
-            and final_queued == 0
-            and failed == 0
-            and rejected == 0)
+    return not sustainability_failures(
+        target_qps, achieved_qps, ttft_p99_ns, tpot_p99_ns, peak_queued,
+        final_active, final_queued, failed, rejected, requests,
+        throughput_ratio, queue_fraction, max_p99_ttft_ns,
+        max_p99_tpot_ns)
 
 
 def probe_result_from_summary(target_qps, summary, args):
@@ -105,6 +132,21 @@ def find_max_qps(probe: Callable[[float], ProbeResult], start_qps: float,
     return lower
 
 
+def build_probe_command(benchmark, trace, model, output, qps, args):
+    command = [
+        str(benchmark), "--trace", str(trace), "--model", str(model),
+        "--target-qps", f"{qps:.12g}", "--max-requests", str(args.requests),
+        "--output-mode", args.output_mode, "--output-dir", str(output),
+        "--context-size", str(args.context_size),
+        "--batch-capacity", str(args.batch_capacity),
+        "--max-sequences", str(args.max_sequences),
+        "--token-budget", str(args.token_budget),
+    ]
+    if args.policy_config is not None:
+        command.extend(["--policy-config", str(args.policy_config)])
+    return command
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Estimate maximum sustainable QPS with an exponential sweep "
@@ -112,6 +154,7 @@ def parse_args():
     parser.add_argument("--benchmark", default="build-benchmark/quickserve_benchmark")
     parser.add_argument("--trace", default="data/AzureLLMInferenceTrace_code_1week.qst")
     parser.add_argument("--model", required=True)
+    parser.add_argument("--policy-config", type=pathlib.Path)
     parser.add_argument("--start-qps", type=float, default=2.0)
     parser.add_argument("--max-qps", type=float, default=128.0)
     parser.add_argument("--requests", type=int, default=128)
@@ -153,6 +196,8 @@ def main():
         benchmark = pathlib.Path(args.benchmark).resolve(strict=True)
         trace = pathlib.Path(args.trace).resolve(strict=True)
         model = pathlib.Path(args.model).resolve(strict=True)
+        if args.policy_config is not None:
+            args.policy_config = args.policy_config.resolve(strict=True)
     except (ValueError, FileNotFoundError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -172,15 +217,8 @@ def main():
         nonlocal probe_number
         probe_number += 1
         output = root / f"probe-{probe_number:02d}-qps-{qps:.4f}"
-        command = [
-            str(benchmark), "--trace", str(trace), "--model", str(model),
-            "--target-qps", f"{qps:.12g}", "--max-requests", str(args.requests),
-            "--output-mode", args.output_mode, "--output-dir", str(output),
-            "--context-size", str(args.context_size),
-            "--batch-capacity", str(args.batch_capacity),
-            "--max-sequences", str(args.max_sequences),
-            "--token-budget", str(args.token_budget),
-        ]
+        command = build_probe_command(
+            benchmark, trace, model, output, qps, args)
         print(f"[{probe_number}] testing {qps:.3f} QPS ... ", end="", flush=True)
         completed = subprocess.run(command, text=True, capture_output=True)
         if completed.returncode != 0:
@@ -190,8 +228,16 @@ def main():
             summary = json.load(stream)
         result = probe_result_from_summary(qps, summary, args)
         results.append(result)
+        failures = sustainability_failures(
+            qps, result.achieved_qps, result.ttft_p99_ns,
+            result.tpot_p99_ns, result.peak_queued, result.final_active,
+            result.final_queued, result.failed, result.rejected, args.requests,
+            args.throughput_ratio, args.max_queue_fraction,
+            args.max_p99_ttft_ms * 1_000_000,
+            args.max_p99_tpot_ms * 1_000_000)
+        status = "PASS" if not failures else "FAIL: " + "; ".join(failures)
         print(f"achieved {result.achieved_qps:.3f}, peak queue "
-              f"{result.peak_queued}: {'PASS' if result.sustainable else 'FAIL'}")
+              f"{result.peak_queued}: {status}")
         return result
 
     try:

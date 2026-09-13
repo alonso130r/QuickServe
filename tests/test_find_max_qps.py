@@ -37,6 +37,33 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(args.max_p99_ttft_ms, 2000)
         self.assertEqual(args.max_p99_tpot_ms, 200)
 
+    def test_accepts_and_forwards_policy_config(self):
+        module = load_script()
+        with mock.patch.object(
+                sys, "argv",
+                ["find_max_qps.py", "--model", "model.gguf",
+                 "--policy-config", "proxqp.conf"]):
+            args = module.parse_args()
+
+        command = module.build_probe_command(
+            pathlib.Path("benchmark"), pathlib.Path("trace.qst"),
+            pathlib.Path("model.gguf"), pathlib.Path("result"), 3.5, args)
+
+        self.assertEqual(args.policy_config, pathlib.Path("proxqp.conf"))
+        self.assertEqual(command[-2:], ["--policy-config", "proxqp.conf"])
+
+    def test_omits_policy_config_when_not_requested(self):
+        module = load_script()
+        with mock.patch.object(sys, "argv",
+                               ["find_max_qps.py", "--model", "model.gguf"]):
+            args = module.parse_args()
+
+        command = module.build_probe_command(
+            pathlib.Path("benchmark"), pathlib.Path("trace.qst"),
+            pathlib.Path("model.gguf"), pathlib.Path("result"), 3.5, args)
+
+        self.assertNotIn("--policy-config", command)
+
     def test_exponential_sweep_then_binary_search(self):
         module = load_script()
         probes = []
@@ -109,6 +136,24 @@ class SearchTests(unittest.TestCase):
         metrics = self.sustainable_metrics()
         self.assertFalse(module.is_sustainable(**{**metrics, "failed": 1}))
         self.assertFalse(module.is_sustainable(**{**metrics, "rejected": 1}))
+
+    def test_reports_each_failed_sustainability_gate(self):
+        module = load_script()
+        metrics = self.sustainable_metrics()
+        failures = module.sustainability_failures(**{
+            **metrics,
+            "achieved_qps": 9.7,
+            "ttft_p99_ns": 5_736_041_237,
+            "peak_queued": 26,
+            "failed": 1,
+        })
+
+        self.assertEqual(failures, [
+            "achieved QPS 9.700 < 9.800",
+            "p99 TTFT 5736.0 ms > 2000.0 ms",
+            "peak queue 26 > 25",
+            "failed requests 1 > 0",
+        ])
 
     def test_validates_latency_limits(self):
         module = load_script()
